@@ -95,6 +95,48 @@ static void hud_text(f32 x, f32 y, f32 scale, u32 colour, const char *fmt, ...) 
     C2D_DrawText(&text, C2D_WithColor, x, y, 0.5f, scale, scale, colour);
 }
 
+/* Seconds -> "M:SS.hh", the format every racing game uses, because "83.4 s" is
+ * not a lap time anyone can compare against a memory of one.
+ *
+ * A negative value is lap.h's LAP_NO_TIME sentinel meaning "no lap finished
+ * yet" and renders as dashes. Tested with < 0.0f rather than == LAP_NO_TIME:
+ * comparing a float against a sentinel for exact equality is how a sentinel
+ * that has been through one arithmetic operation stops matching. */
+static void hud_format_time(char *out, size_t out_size, f32 seconds) {
+    int minutes, whole, hundredths;
+
+    if (seconds < 0.0f) {
+        snprintf(out, out_size, "--:--.--");
+        return;
+    }
+    /* Truncate, do not round: a lap shown as 1:20.00 that was actually
+     * 1:19.996 reads as a whole hundredth slower than it was, and rounding UP
+     * across the minute boundary would print 1:59.100 -> 2:00.00 for a time
+     * that never reached two minutes. */
+    whole = (int)seconds;
+    hundredths = (int)((seconds - (f32)whole) * 100.0f);
+
+    /* EVERY field is clamped, and not for cosmetic reasons. gcc's
+     * -Werror=format-truncation reasons about the value ranges it can prove,
+     * and it cannot prove anything about an int derived from a float: it
+     * assumed all three conversions could be eleven digits and reported
+     * "output between 8 and 26 bytes into a destination of size 16".
+     *
+     * Widening the buffer is the wrong fix -- it silences the diagnostic
+     * without making the range true. Clamping is what actually makes the
+     * bound hold: minutes and hundredths become two digits each and
+     * whole % 60 becomes 0..59, so the result is provably 8 bytes.
+     *
+     * 5999 seconds is 99:59. A lap longer than that is not a lap. */
+    if (whole < 0) whole = 0;
+    if (whole > 5999) whole = 5999;
+    if (hundredths < 0) hundredths = 0;
+    if (hundredths > 99) hundredths = 99;
+    minutes = whole / 60;
+
+    snprintf(out, out_size, "%d:%02d.%02d", minutes, whole % 60, hundredths);
+}
+
 /* A horizontal fill bar: slot, then `fraction` of it filled from the left.
  * Clamped here rather than at every call site -- an out-of-range fraction is
  * a bug in the caller's data, and a bar that draws outside its own slot hides
@@ -202,6 +244,7 @@ void hud_draw(const HudStats *stats) {
     C2D_DrawRectSolid(0.0f, 0.0f, 0.0f, 320.0f, 18.0f, CLR_BAND);
     hud_text(6.0f, 2.0f, 0.50f, CLR_ACCENT, "DiRT2");
     hud_text(52.0f, 3.0f, 0.42f, CLR_DIM, "TELEMETRY");
+    hud_text(130.0f, 2.0f, 0.50f, CLR_TEXT, "LAP %d", stats->lap_count + 1);
     hud_text(196.0f, 3.0f, 0.42f, CLR_DIM, "%4.1f fps  %4.1f ms",
              (double)stats->fps, (double)stats->frame_ms);
 
@@ -273,12 +316,34 @@ void hud_draw(const HudStats *stats) {
         hud_text(x, y + 28.0f, 0.36f, CLR_DIM, "%.3f m", (double)w->compression);
     }
 
-    /* ---- controls reminder, bottom strip ----
-     * Cheap, and it is the difference between handing someone the console and
-     * handing them the console plus an explanation. */
-    C2D_DrawRectSolid(0.0f, 224.0f, 0.0f, 320.0f, 16.0f, CLR_BAND);
-    hud_text(6.0f, 226.0f, 0.40f, CLR_DIM,
-             "R throttle   L brake   A handbrake   START exit");
+    /* ---- race strip, bottom of the panel ----
+     * The band's own background doubles as the lap progress bar: it fills from
+     * the left as the car goes round. That is why there is no separate bar
+     * widget here -- a 320-wide strip that is already the full width of the
+     * screen is the best progress bar available, and spending 8 more pixels of
+     * a 240-pixel screen on a second one would be worse, not better.
+     *
+     * OFF-COURSE is shown by turning the whole strip red rather than by adding
+     * a label. The strip is in peripheral vision while the driver looks at the
+     * top screen, and a colour change is the only thing peripheral vision
+     * actually resolves; a word saying "OFF" would never be read. */
+    C2D_DrawRectSolid(0.0f, 224.0f, 0.0f, 320.0f, 16.0f,
+                      stats->on_track ? CLR_BAND : CLR_STOP);
+    if (stats->on_track) {
+        f32 p = stats->lap_progress;
+        if (!(p > 0.0f)) p = 0.0f;
+        if (p > 1.0f) p = 1.0f;
+        C2D_DrawRectSolid(0.0f, 224.0f, 0.0f, 320.0f * p, 16.0f, CLR_SLOT);
+    }
+    {
+        char cur[16], last[16], best[16];
+        hud_format_time(cur, sizeof(cur), stats->current_lap_time);
+        hud_format_time(last, sizeof(last), stats->last_lap_time);
+        hud_format_time(best, sizeof(best), stats->best_lap_time);
+        hud_text(6.0f, 226.0f, 0.40f, CLR_TEXT, "%s", cur);
+        hud_text(96.0f, 226.0f, 0.40f, CLR_DIM, "last %s", last);
+        hud_text(206.0f, 226.0f, 0.40f, CLR_ACCENT, "best %s", best);
+    }
 
     C2D_Flush();
 #else

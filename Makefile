@@ -32,7 +32,7 @@ include $(DEVKITARM)/3ds_rules
 #---------------------------------------------------------------------------------
 TARGET		:=	dirt2
 BUILD		:=	build
-SOURCES		:=	source source/core source/vehicle source/input source/render source/world
+SOURCES		:=	source source/core source/vehicle source/input source/render source/world source/race
 DATA		:=	data
 INCLUDES	:=	source
 ROMFS		:=	romfs

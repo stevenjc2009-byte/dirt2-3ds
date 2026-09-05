@@ -174,6 +174,33 @@ static int s_vehicle_vert_count = 0;
  * yet (see this function group's header note), just enough shading for
  * shapes to read as three-dimensional rather than flat silhouettes. */
 #define RENDERER_LIGHT_AMBIENT 0.25f
+
+/* Track ribbon sizing: one segment per waypoint (segment i runs
+ * waypoints[i] -> waypoints[(i+1)%count], see track.h), 2 triangles (6
+ * non-indexed verts) per segment -- TRACK_MAX_WAYPOINTS*6 = 64*6 = 384 verts,
+ * 384*32 = 12288 bytes, allocated once. Sized from TRACK_MAX_WAYPOINTS
+ * (race/track.h) rather than a hand-typed number so a full 64-waypoint track
+ * cannot overflow this buffer -- renderer_draw_track additionally clamps its
+ * own loop count to TRACK_MAX_WAYPOINTS as a second, cheap backstop. */
+#define RENDERER_TRACK_MAX_VERTS (TRACK_MAX_WAYPOINTS * 6)
+
+/* Vertical lift applied to every ribbon vertex above the queried ground
+ * height, so the track surface does not z-fight with the terrain patch
+ * renderer_draw_ground draws at the same X/Z. 3 cm: comfortably above
+ * anything a float height sample plus GEQUAL depth test could tie on, but a
+ * small fraction (1/5) of the 0.15 m suspension travel the car's wheels
+ * already move through, so the ribbon reads as "this IS the ground here",
+ * not as a raised curb the car would visibly step up onto. */
+#define RENDERER_TRACK_SURFACE_LIFT 0.03f
+
+/* Length of the start/finish band along the track, in metres. 3 m is about
+ * one car length (this chassis is 2.55 m between axles), which is what makes
+ * it read as a line painted across the road rather than as a differently
+ * surfaced stretch of it. */
+#define RENDERER_TRACK_START_LINE_METRES 3.0f
+
+static RenderVertex *s_track_verts = NULL;
+static int s_track_vert_count = 0;
 #endif /* __3DS__ */
 
 void renderer_init(void) {
@@ -230,6 +257,7 @@ void renderer_init(void) {
      * if one of these allocations somehow failed. */
     s_ground_verts = (RenderVertex *)linearAlloc(RENDERER_GROUND_MAX_VERTS * sizeof(RenderVertex));
     s_vehicle_verts = (RenderVertex *)linearAlloc(RENDERER_VEHICLE_MAX_VERTS * sizeof(RenderVertex));
+    s_track_verts = (RenderVertex *)linearAlloc(RENDERER_TRACK_MAX_VERTS * sizeof(RenderVertex));
 
     s_ready = true;
 #endif
@@ -239,6 +267,10 @@ void renderer_shutdown(void) {
 #ifdef __3DS__
     if (!s_ready) return;
 
+    if (s_track_verts) {
+        linearFree(s_track_verts);
+        s_track_verts = NULL;
+    }
     if (s_vehicle_verts) {
         linearFree(s_vehicle_verts);
         s_vehicle_verts = NULL;
@@ -591,6 +623,219 @@ void renderer_draw_vehicle(Vec3 chassis_pos, Quat chassis_orient,
     }
 #else
     (void)chassis_pos; (void)chassis_orient; (void)wheel_local_offsets;
+#endif
+}
+
+#ifdef __3DS__
+static void track_push_vertex(Vec3 pos, Vec3 color) {
+    RenderVertex *v = &s_track_verts[s_track_vert_count];
+    v->pos[0] = pos.x; v->pos[1] = pos.y; v->pos[2] = pos.z; v->pos[3] = 1.0f;
+    v->col[0] = color.x; v->col[1] = color.y; v->col[2] = color.z; v->col[3] = 1.0f;
+    s_track_vert_count++;
+}
+
+/* Dirt/gravel grey-brown for the ordinary racing surface -- distinct in hue
+ * (flatter, greyer) from every ground_zone_color band (all three of which
+ * lean green or tan), so the track reads as a different material rather than
+ * another terrain zone. Owned entirely by this file, not a supplied asset. */
+static const Vec3 RENDERER_TRACK_SURFACE_COLOR = { 0.42f, 0.40f, 0.37f };
+
+/* Bright near-white band for the waypoints[0]->waypoints[1] segment -- the
+ * start/finish line (see renderer.h's header comment on renderer_draw_track)
+ * -- unmistakably different from both the dirt ribbon and the terrain. */
+static const Vec3 RENDERER_TRACK_START_COLOR = { 0.95f, 0.95f, 0.95f };
+#endif /* __3DS__ */
+
+void renderer_draw_track(const Testground *tg, const Track *track) {
+#ifdef __3DS__
+    /* One left/right ribbon-edge vertex per waypoint, computed ONCE and
+     * shared by the two quads that meet there (this waypoint's outgoing
+     * segment and the previous waypoint's segment) -- same "compute once per
+     * shared point, duplicate into the non-indexed vertex buffer per quad"
+     * policy as renderer_draw_ground's s_grid_pos/s_grid_color. `static` so
+     * this is BSS, not stack. */
+    static Vec3 s_edge_left[TRACK_MAX_WAYPOINTS];
+    static Vec3 s_edge_right[TRACK_MAX_WAYPOINTS];
+    static bool s_edge_valid[TRACK_MAX_WAYPOINTS];
+    int i, count;
+
+    if (!s_ready || !s_track_verts || !tg || !track) return;
+
+    count = track->count;
+    if (count > TRACK_MAX_WAYPOINTS) count = TRACK_MAX_WAYPOINTS; /* fail
+        closed against a corrupt/oversized Track rather than reading past
+        s_edge_left/s_edge_right/s_edge_valid -- track_init's own contract
+        already caps count at TRACK_MAX_WAYPOINTS, this is a second, cheap
+        backstop (see requirement in renderer.h/the task brief). */
+    if (count < 3) return; /* not a loop, nothing to draw */
+
+    for (i = 0; i < count; i++) {
+        int prev = (i - 1 + count) % count;
+        int next = (i + 1) % count;
+        Vec3 to_here = vec3_sub(track->waypoints[i].center, track->waypoints[prev].center);
+        Vec3 to_next = vec3_sub(track->waypoints[next].center, track->waypoints[i].center);
+        Vec3 dir_in, dir_out, tangent, left_dir;
+        f32 wx_l, wz_l, wx_r, wz_r, h_l, h_r;
+        Vec3 n_unused;
+        bool ok_l, ok_r;
+
+        /* XZ-plane direction only -- track.h's file header is explicit that
+         * every query in this module ignores Y entirely; this isn't a
+         * track_query call, but the ribbon's edge offsets are a ground-plan
+         * (X/Z) construction in exactly the same sense, so the same rule
+         * applies to the tangent computed here. */
+        to_here.y = 0.0f;
+        to_next.y = 0.0f;
+        dir_in = vec3_normalize(to_here);
+        dir_out = vec3_normalize(to_next);
+        tangent = vec3_normalize(vec3_add(dir_in, dir_out));
+        if (vec3_length_sq(tangent) < 1e-8f) tangent = dir_out; /* dir_in and
+            dir_out exactly cancel (a zero-radius hairpin) -- fall back to
+            the outgoing direction rather than keep a zero-length tangent. */
+
+        /* Perpendicular to `tangent` in the XZ plane, rotated so that
+         * cross(tangent, left_dir) has a POSITIVE y component -- the same
+         * "positive is to the LEFT of the driving direction" convention
+         * TrackQueryResult.lateral_offset documents (track.h), so this
+         * ribbon's "left" matches what the rest of the race code already
+         * calls left. Derivation: for tangent=(tx,0,tz), left_dir=(-tz,0,tx)
+         * is perpendicular (dot = tx*-tz + tz*tx = 0) and, using vec3_cross's
+         * definition, cross(tangent,left_dir).y = tx*tx - tz*(-tz) =
+         * tx^2+tz^2 = 1 for a unit tangent -- positive, as required. */
+        left_dir = vec3_make(-tangent.z, 0.0f, tangent.x);
+
+        wx_l = track->waypoints[i].center.x + left_dir.x * track->waypoints[i].half_width;
+        wz_l = track->waypoints[i].center.z + left_dir.z * track->waypoints[i].half_width;
+        wx_r = track->waypoints[i].center.x - left_dir.x * track->waypoints[i].half_width;
+        wz_r = track->waypoints[i].center.z - left_dir.z * track->waypoints[i].half_width;
+
+        /* Ground height, NOT track->waypoints[i].center.y -- see track.h's
+         * file header ("a track waypoint's Y is not read by any query
+         * here... the world's own height query is the only source of truth
+         * for ground height") and renderer_draw_ground's identical use of
+         * testground_query for the terrain patch this ribbon sits on top of. */
+        ok_l = testground_query(tg, wx_l, wz_l, &h_l, &n_unused);
+        ok_r = testground_query(tg, wx_r, wz_r, &h_r, &n_unused);
+        s_edge_valid[i] = ok_l && ok_r;
+        if (s_edge_valid[i]) {
+            s_edge_left[i]  = vec3_make(wx_l, h_l + RENDERER_TRACK_SURFACE_LIFT, wz_l);
+            s_edge_right[i] = vec3_make(wx_r, h_r + RENDERER_TRACK_SURFACE_LIFT, wz_r);
+        }
+    }
+
+    s_track_vert_count = 0;
+    for (i = 0; i < count; i++) {
+        int next = (i + 1) % count;
+        Vec3 r0, r1, l0, l1, color;
+
+        if (!s_edge_valid[i] || !s_edge_valid[next])
+            continue; /* an edge is off the heightfield -- skip the whole
+                quad rather than guess a height for the missing corner, same
+                policy as renderer_draw_ground. */
+
+        if (s_track_vert_count + 6 > RENDERER_TRACK_MAX_VERTS)
+            break; /* unreachable given this buffer's TRACK_MAX_WAYPOINTS*6
+                sizing (see its declaration) -- fail closed regardless. */
+
+        r0 = s_edge_right[i];
+        r1 = s_edge_right[next];
+        l0 = s_edge_left[i];
+        l1 = s_edge_left[next];
+
+        /* Every segment is the same dirt/gravel colour. The start/finish
+         * marking is NOT a coloured segment -- see the separate band emitted
+         * after this loop and the comment there for why. */
+        color = RENDERER_TRACK_SURFACE_COLOR;
+
+        /* WINDING, and this was wrong once. The first version emitted
+         * (r0,r1,l0) + (l0,r1,l1), reasoning by analogy with
+         * renderer_draw_ground's index pattern. On hardware that produced a
+         * completely invisible track: every triangle was back-facing and
+         * GPU_CULL_BACK_CCW removed all of them, which looks exactly like
+         * "the draw call never ran" and cost a build to tell apart.
+         *
+         * Measured, not re-derived: with C3D_CullFace(GPU_CULL_NONE) the
+         * whole ribbon rendered correctly in the same frame, which isolates
+         * the fault to winding and nothing else -- not the vertex buffer, not
+         * the height queries, not the depth test, not the attribute layout.
+         *
+         * The order below is the reverse of that, i.e. (r0,l0,r1) +
+         * (l0,l1,r1), and is verified front-facing under GPU_CULL_BACK_CCW
+         * by the capture that followed. */
+        track_push_vertex(r0, color);
+        track_push_vertex(l0, color);
+        track_push_vertex(r1, color);
+
+        track_push_vertex(l0, color);
+        track_push_vertex(l1, color);
+        track_push_vertex(r1, color);
+    }
+
+    /* ---- start/finish band ----
+     * A SHORT band across the track at waypoint 0, not a recoloured segment.
+     * Colouring segment 0 was the first attempt and it is wrong for this
+     * circuit: waypoints[0] -> waypoints[1] is the entire 96 m left-hand
+     * straight, so the "line" rendered as a 96-metre white road. A start line
+     * has to be short enough to be a landmark; a segment's length is a
+     * property of how the track was tessellated and has nothing to do with
+     * that.
+     *
+     * RENDERER_TRACK_START_LINE_METRES along the segment, or the whole
+     * segment if the segment is shorter than that -- a densely tessellated
+     * track must not produce a band longer than the segment it sits on. */
+    if (s_edge_valid[0] && s_edge_valid[1 % count] &&
+        s_track_vert_count + 6 <= RENDERER_TRACK_MAX_VERTS) {
+        int next = 1 % count;
+        Vec3 l0 = s_edge_left[0],  l1 = s_edge_left[next];
+        Vec3 r0 = s_edge_right[0], r1 = s_edge_right[next];
+        f32 span = vec3_length(vec3_sub(l1, l0));
+        f32 t = (span > RENDERER_TRACK_START_LINE_METRES)
+                    ? (RENDERER_TRACK_START_LINE_METRES / span)
+                    : 1.0f;
+        /* Lifted again above the ribbon it sits on, for the same reason the
+         * ribbon is lifted above the terrain: two coplanar surfaces at the
+         * same height z-fight, and the loser flickers per pixel. */
+        Vec3 up = vec3_make(0.0f, RENDERER_TRACK_SURFACE_LIFT * 0.5f, 0.0f);
+        Vec3 bl = vec3_add(l0, up);
+        Vec3 br = vec3_add(r0, up);
+        Vec3 fl = vec3_add(vec3_lerp(l0, l1, t), up);
+        Vec3 fr = vec3_add(vec3_lerp(r0, r1, t), up);
+
+        track_push_vertex(br, RENDERER_TRACK_START_COLOR);
+        track_push_vertex(bl, RENDERER_TRACK_START_COLOR);
+        track_push_vertex(fr, RENDERER_TRACK_START_COLOR);
+
+        track_push_vertex(bl, RENDERER_TRACK_START_COLOR);
+        track_push_vertex(fl, RENDERER_TRACK_START_COLOR);
+        track_push_vertex(fr, RENDERER_TRACK_START_COLOR);
+    }
+
+    if (s_track_vert_count > 0) {
+        C3D_AttrInfo *attr = C3D_GetAttrInfo();
+        AttrInfo_Init(attr);
+        AttrInfo_AddLoader(attr, 0, GPU_FLOAT, 4); /* position */
+        AttrInfo_AddLoader(attr, 1, GPU_FLOAT, 4); /* colour   */
+
+        C3D_BufInfo *buf = C3D_GetBufInfo();
+        BufInfo_Init(buf);
+        BufInfo_Add(buf, s_track_verts, sizeof(RenderVertex), 2, 0x10);
+
+        C3D_TexEnv *env = C3D_GetTexEnv(0);
+        C3D_TexEnvInit(env);
+        C3D_TexEnvSrc(env, C3D_Both, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR, GPU_PRIMARY_COLOR);
+        C3D_TexEnvFunc(env, C3D_Both, GPU_REPLACE);
+
+        /* Real, correctly-wound geometry -- cull backfaces, then restore
+         * GPU_CULL_NONE so debugdraw's own later draw this frame (which
+         * relies on that baseline, see its header comment) keeps working
+         * unchanged. Same bracket as renderer_draw_ground/renderer_draw_vehicle. */
+        C3D_CullFace(GPU_CULL_BACK_CCW);
+        GSPGPU_FlushDataCache(s_track_verts, (u32)(s_track_vert_count * sizeof(RenderVertex)));
+        C3D_DrawArrays(GPU_TRIANGLES, 0, s_track_vert_count);
+        C3D_CullFace(GPU_CULL_NONE);
+    }
+#else
+    (void)tg; (void)track;
 #endif
 }
 

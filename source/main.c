@@ -31,6 +31,8 @@
 #include "render/camera.h"
 #include "render/debugdraw.h"
 #include "render/hud.h"
+#include "race/track.h"
+#include "race/lap.h"
 #include "world/testground.h"
 
 #ifdef __3DS__
@@ -228,7 +230,24 @@ static void make_placeholder_input_config(InputConfig *config) {
 }
 
 static void place_car_at_start(Vehicle *car) {
-    car->chassis.position = vec3_make(0.0f, 1.0f, 5.0f);
+    /* ON THE GRID, not next to it. v0.2 gave the world a closed circuit
+     * (race/track.c's track_build_example_oval) and the car has to start on
+     * waypoint 0 of it or no lap can ever be counted -- lap.c only counts a
+     * forward wrap-crossing of the start line, and a car parked outside the
+     * loop never crosses anything.
+     *
+     * (-12, 22) is waypoint 0 exactly: the south end of the left-hand
+     * straight. Was (0, 5), which is off the track entirely -- the bottom
+     * hairpin's nearest point is z = 6. The Y of 1.0 is unchanged and is
+     * deliberately above the ground so the suspension settles the car down
+     * onto the surface in the first few steps rather than starting
+     * interpenetrating it.
+     *
+     * The yaw is UNCHANGED and must stay: -90 degrees about +Y faces world
+     * +Z, which is the direction waypoint 0 -> waypoint 1 runs. Facing the
+     * other way would make every lap a reverse crossing, which lap.c
+     * correctly refuses to count. */
+    car->chassis.position = vec3_make(-12.0f, 1.0f, 22.0f);
     car->chassis.orientation =
         quat_from_axis_angle(vec3_make(0.0f, 1.0f, 0.0f), -1.5707963f);
 }
@@ -329,6 +348,25 @@ int main(int argc, char *argv[]) {
      * happening rather than after it has passed. */
     f32 fps_smoothed = 60.0f;
 
+    /* The circuit and the lap timer. Both live here for the whole run: the
+     * Track is immutable once built, and LapState borrows a pointer to it
+     * (lap.h says borrowed, not owned) so the Track must outlive it -- same
+     * scope, declared in that order, is the simplest way to guarantee that.
+     *
+     * hud_query_segment is track_query's search cache for the HUD's own
+     * per-FRAME query. It is deliberately NOT lap_state.cached_segment:
+     * lap_update owns that one and runs once per physics STEP, and two
+     * callers sharing one cache would have each other's last position as
+     * their search hint. The cache is only a hint -- track_query falls back
+     * to a full scan -- so sharing it would not be wrong, just slower and
+     * confusing about who owns what. */
+    Track track;
+    LapState lap_state;
+    int hud_query_segment = TRACK_UNKNOWN_SEGMENT;
+
+    track_build_example_oval(&track);
+    lap_init(&lap_state, &track);
+
     while (running) {
         f32 frame_dt, alpha;
         Vec3 draw_pos;
@@ -388,6 +426,18 @@ int main(int argc, char *argv[]) {
              * once per step, not once for the whole frame). */
             input_update(&input, &input_config, PHYSICS_DT);
             vehicle_step(&car, &input, PHYSICS_DT);
+
+            /* Once per physics STEP, not once per render frame -- lap.h's
+             * contract. Lap times are accumulated dt, so calling this once
+             * for a frame that owed three steps would run the clock at a
+             * third speed, and the crossing test would sample the car's
+             * position at render cadence and could step clean over the
+             * start line at 128 km/h without noticing.
+             *
+             * Uses the RAW post-step position, not the interpolated draw
+             * pose: the draw pose is one step in the past by design, and a
+             * lap time must measure the simulation, not the picture of it. */
+            lap_update(&lap_state, car.chassis.position, PHYSICS_DT);
         }
 
         /* The interpolated draw pose camera.h and renderer.h both ask for.
@@ -435,6 +485,13 @@ int main(int argc, char *argv[]) {
         }
 
         renderer_draw_ground(&testground, camera.position);
+        /* Track ribbon AFTER the terrain: it is lifted a few centimetres above
+         * the queried ground height rather than being part of it, so it has to
+         * be drawn over the surface it sits on. It takes the Testground as
+         * well as the Track because a waypoint's Y is never authoritative --
+         * see race/track.h -- so every ribbon vertex re-queries the real
+         * ground height at its own XZ. */
+        renderer_draw_track(&testground, &track);
         renderer_draw_vehicle(draw_pos, draw_orient, wheel_offsets);
 
         /* debugdraw on top -- contact points and normals. Not decoration:
@@ -456,6 +513,18 @@ int main(int argc, char *argv[]) {
                        (double)timestep_get_alpha(&timestep));
         debugdraw_text(4.0f, 16.0f, 0xFFFFFFFF, "speed %.1f m/s",
                        (double)vec3_length(car.chassis.linear_velocity));
+
+        /* Lap and clock on the TOP screen as well as the bottom one, and not
+         * as duplication for its own sake: this is the one readout a driver
+         * needs without looking away from the road, and looking down at the
+         * bottom screen mid-corner is exactly when it cannot be read. Kept to
+         * one line -- the detail (last, best, progress, off-course) stays
+         * downstairs where there is room for it. */
+        debugdraw_text(4.0f, 28.0f, 0xFFD060FF, "lap %d   %d:%05.2f",
+                       lap_state.lap_count + 1,
+                       (int)(lap_state.current_lap_time / 60.0f),
+                       (double)(lap_state.current_lap_time -
+                                60.0f * (f32)(int)(lap_state.current_lap_time / 60.0f)));
 
         debugdraw_frame_end();
 
@@ -490,6 +559,31 @@ int main(int argc, char *argv[]) {
         hud_stats.frame_ms = frame_dt * 1000.0f;
         hud_stats.fps = fps_smoothed;
         hud_stats.physics_steps = steps;
+
+        /* Race state. The lap counter and the two stored times come straight
+         * off LapState; progress and lateral offset need their own query
+         * because lap_update keeps neither -- it only needs the crossing. */
+        {
+            TrackQueryResult q;
+            f32 off;
+            track_query(&track, car.chassis.position, &hud_query_segment, &q);
+            off = q.lateral_offset < 0.0f ? -q.lateral_offset : q.lateral_offset;
+
+            hud_stats.lap_count = lap_state.lap_count;
+            hud_stats.current_lap_time = lap_state.current_lap_time;
+            hud_stats.last_lap_time = lap_state.last_lap_time;
+            hud_stats.best_lap_time = lap_state.best_lap_time;
+            hud_stats.lap_progress = q.progress;
+            hud_stats.lateral_offset = q.lateral_offset;
+            hud_stats.track_half_width = q.half_width;
+            /* The off-course VERDICT is made here, not in hud.c, so the
+             * bottom screen states no policy about what counts as on-track --
+             * see hud.h. Today it is the plain "within the ribbon" test
+             * track.h suggests; a real rally game would want a grace period
+             * and a two-wheels-off rule, and that would change here. */
+            hud_stats.on_track = (off <= q.half_width);
+        }
+
         for (i = 0; i < VEHICLE_WHEEL_COUNT; i++) {
             const SuspensionState *ws = &car.wheels[i].suspension;
             hud_stats.wheels[i].compression = ws->compression;

@@ -56,6 +56,26 @@ typedef struct HudStats {
     uint32_t physics_steps; /* steps run this frame                           */
 
     HudWheel wheels[4];    /* VEHICLE_WHEEL_COUNT, in WheelIndex order        */
+
+    /* Race state, straight off race/lap.h's LapState. Copied rather than
+     * pointed at for the same reason as everything else here: this module
+     * must not include race/lap.h, or the bottom screen stops being drawable
+     * without a track. A build with no track fills these with zeroes and
+     * LAP_NO_TIME and the panel renders correctly.
+     *
+     * The two lap times use lap.h's LAP_NO_TIME sentinel (-1.0f) for "not set
+     * yet", which is why they are signed and why hud.c tests for negative
+     * rather than for zero -- a genuine lap time of 0.0s is impossible, but a
+     * lap time is a float and testing floats for equality to a sentinel is
+     * how a sentinel gets missed. */
+    int lap_count;
+    f32 current_lap_time;  /* seconds, the open lap                           */
+    f32 last_lap_time;     /* seconds, negative == no lap finished yet        */
+    f32 best_lap_time;     /* seconds, negative == no lap finished yet        */
+    f32 lap_progress;      /* 0..1 around the loop, for the progress bar      */
+    f32 lateral_offset;    /* signed metres from the centreline               */
+    f32 track_half_width;  /* metres; |lateral_offset| beyond this is off-course */
+    bool on_track;         /* caller's verdict, so hud.c states no policy     */
 } HudStats;
 
 /* Creates the bottom-screen render target and this module's text buffer.

@@ -3,6 +3,7 @@ build-host/
 build-host-60/
 build-host-100/
 build-host-120/
+build-host-race/
 *.3dsx
 *.elf
 *.smdh

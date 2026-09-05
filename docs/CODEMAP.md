@@ -22,6 +22,7 @@ dirt2/
     core/                 math, rigid body, fixed timestep -- no vehicle knowledge
     vehicle/              chassis + wheels + the canonical per-step order
     input/                Circle Pad / button reading, ramped to vehicle-ready input
+    race/                 the circuit itself: waypoint loop, lap counting, lap timing
     render/                citro3d/citro2d setup, camera, debug wireframe/text draw
     world/                 procedural Phase 1 test heightfield
   tests/                  host-side smoke tests for the physics core
@@ -62,7 +63,15 @@ dirt2/
 |---|---|
 | `render/renderer.h` / `.c` | One-time citro3d/citro2d/render-target setup; `renderer_frame_begin/end` brackets each GPU frame. Top screen only, no stereo yet (Old 3DS baseline). |
 | `render/camera.h` / `.c` | Smoothed chase camera, reads the vehicle's already-**interpolated** draw pose (see `core/timestep.h`'s alpha) -- has no knowledge of physics steps or `PHYSICS_DT`. |
+| `render/hud.h` / `.c` | The **bottom** screen (320x240) and its own render target -- `renderer.c` owns the top screen and nothing else, so the panel can be dropped or replaced without touching the 3D path. Speed, engine rpm with a redline-marked bar, ramped throttle/brake/steer bars, per-wheel compression/load, lap count and lap times. `hud_draw` takes one `HudStats` struct by pointer and therefore has **zero dependency on `Vehicle`** -- it renders numbers it is handed and cannot be broken by a physics refactor. Two ordering rules, both load-bearing: it must be called **inside** `renderer_frame_begin`/`end` and **after** everything top-screen (it switches the draw target and leaves it switched), and it deliberately does **not** call `C2D_Prepare` because `debugdraw_frame_end` already did this frame. |
 | `render/debugdraw.h` / `.c` | Immediate-mode world-space lines/wire boxes/points (citro3d) and screen-space text (citro2d) -- the load-bearing Phase 1 tool for actually **seeing** suspension compression/rebound and tyre slip on real hardware, per this project's verify-before-claiming-done discipline. Explicitly separate from `renderer.h`'s real car/world rendering. |
+
+### race/ -- the circuit, lap counting and lap timing
+
+| File | Owns |
+|---|---|
+| `race/track.h` / `.c` | A closed-loop circuit as an ordered ring of waypoints (`center` + `half_width`), **2D in the XZ plane** -- a waypoint's Y is never read, because `world/testground.h`'s height query is the only source of truth for how high the ground is. `track_query` returns the nearest segment, 0..1 progress round the loop, and a **signed** lateral offset from the centreline, using a windowed search around a caller-held `cached_segment` hint with a full-scan fallback. The module holds no state of its own: that `int` is the only thing persisted, which is why two callers (lap counting and the HUD) each keep their own. `track_build_example_oval` builds the concrete v0.2 stadium oval -- 8 m wide, 12 m hairpins, 96 m straights -- sized by hand against the placeholder testground's extents (X +/-25, Z 0..140). |
+| `race/lap.h` / `.c` | Lap counting and timing on top of `track_query`'s progress. A lap counts only on a **forward wrap-crossing** and only once the car has previously reached progress >= 0.5 (`far_side_reached`) -- that gate is what defeats sitting on the line, an out-and-back, and a reverse-then-forward double crossing, three cases a naive "progress jumped by more than 0.5" detector counts wrongly. A crossing that happens mid-step splits that step's `dt` proportionally between the finishing lap and the new one. Called **once per physics step**, never once per render frame: the times are accumulated `dt`, and at 128 km/h a render-cadence sample can step clean over the start line. |
 
 ### world/ -- Phase 1 test terrain
 
@@ -75,6 +84,7 @@ dirt2/
 | File | Owns |
 |---|---|
 | `tests/test_physics.c` | The actual checks, run via `run_physics_tests()`. Currently smoke-level (confirms `PHYSICS_HZ`/`PHYSICS_DT` resolve correctly, confirms the documented `vehicle_step` call sequence runs 10 steps without crashing) with `TODO(...)` markers for the real physical assertions once suspension/tyre/rigidbody are implemented. |
+| `tests/test_race.c` | The race module's checks: progress monotonicity and wrapping, a clean lap, and the three false-positive cases the `far_side_reached` gate exists for (reverse crossing, out-and-back, back-and-forth), plus best-time-only-on-improvement, rate-independent timing, the proportional `dt` split on a same-step completion, `lap_notify_reset`, and starting mid-lap. Rate-independent via `seconds_to_steps`, same convention as `test_physics.c`, and carries the same `DIRT2_INJECT_FAULT` scheme so each check can be proven able to go red. Has its own `main()` and so builds as a **separate host binary** from `test_main.c`. |
 | `tests/test_main.c` | Thin entry point: calls `run_physics_tests()`, turns the failure count into a process exit code (0 = all passed). |
 
 ### source/main.c

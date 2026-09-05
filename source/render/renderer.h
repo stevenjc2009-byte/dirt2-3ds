@@ -20,6 +20,12 @@
 #include "world/testground.h" /* Testground, for renderer_draw_ground below --
     main.c already includes this directly too (it owns picking/generating the
     world), so this adds no new file to main.c's include graph. */
+#include "race/track.h" /* Track/TrackWaypoint/TRACK_MAX_WAYPOINTS, for
+    renderer_draw_track below. Data-only dependency: renderer_draw_track reads
+    track->waypoints/count directly and never calls track_init/track_query, so
+    this header include carries no link-time dependency on race/track.c --
+    whether or not race/track.c is in the Makefile's SOURCES list yet is
+    irrelevant to whether THIS file builds. */
 
 #ifdef __cplusplus
 extern "C" {
@@ -75,6 +81,28 @@ void renderer_draw_ground(const Testground *tg, Vec3 focus);
  *     itself and does not know or care where the numbers came from. */
 void renderer_draw_vehicle(Vec3 chassis_pos, Quat chassis_orient,
                             const Vec3 wheel_local_offsets[VEHICLE_WHEEL_COUNT]);
+
+/* Rebuilds and draws the racing surface as a flat ribbon around `track`'s
+ * closed loop -- one quad per segment (waypoints[i] to waypoints[(i+1)%count],
+ * including the closing pair, since the track is a LOOP with no last
+ * segment excluded), covering the FULL loop every call, same "no persistent
+ * world mesh, rebuild from scratch every draw" policy as
+ * renderer_draw_ground (see this header's note above renderer_draw_ground and
+ * renderer.c's file header for why).
+ *
+ * SIGNATURE NOTE: the brief for this function asked for
+ * `renderer_draw_track(const Track *track)`, but track.h is explicit that a
+ * waypoint's Y is never meaningful ("the world's own height query is the
+ * only source of truth for ground height") -- so the ribbon's vertices must
+ * come from a real height query, not from track->waypoints[i].center.y. `tg`
+ * is that query source, added as a second parameter (matching
+ * renderer_draw_ground's own `tg` parameter) rather than inventing a
+ * height-query callback type; both are read-only.
+ *
+ * `track` is read-only; this function does not call track_query and does not
+ * need or touch any caller-owned cached-segment state (that is lap.h's
+ * concern, not rendering's). */
+void renderer_draw_track(const Testground *tg, const Track *track);
 
 /* ADDITIVE: exposes the top-screen render target so debugdraw.c can hand it
  * to citro2d's C2D_SceneBegin for its screen-space text pass -- renderer.c

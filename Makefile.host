@@ -59,12 +59,45 @@ SRCS := \
 	source/vehicle/vehicle.c \
 	source/world/testground.c \
 	source/input/input.c \
+	source/race/track.c \
+	source/race/lap.c \
 	tests/test_physics.c \
 	tests/test_main.c
 
 OBJS := $(patsubst %.c,$(BUILD)/%.o,$(SRCS))
 
-.PHONY: all test test-rates clean
+#---------------------------------------------------------------------------------
+# Race suite (tests/test_race.c against source/race/track.c + lap.c) -- a
+# SEPARATE target/binary/object dir from the physics suite above, not an
+# addition to SRCS/OBJS: test_race.c defines its own main(), same as
+# test_main.c does for the physics suite, so linking both into one binary
+# is a duplicate-main error. Own build dir (build-host-race) keeps its
+# objects (and any DIRT2_INJECT_FAULT-poisoned ones, see below) from ever
+# being reused by, or clobbering, the physics suite's build-host objects.
+#
+# DIRT2_INJECT_FAULT (see tests/test_race.c's file header): 0 (default) is
+# the normal, all-passing build. Pass a fault number to deliberately break
+# one piece of track.c/lap.c logic without editing either file, e.g.:
+#   make -f Makefile.host race-test DIRT2_INJECT_FAULT=1
+# Only applied to the race suite's own CFLAGS (RACE_CFLAGS) -- the physics
+# suite's CFLAGS above is untouched by this variable.
+#---------------------------------------------------------------------------------
+RACE_BUILD := build-host-race
+RACE_TARGET := $(RACE_BUILD)/dirt2_race_tests
+
+DIRT2_INJECT_FAULT ?= 0
+RACE_CFLAGS := $(CFLAGS) -DDIRT2_INJECT_FAULT=$(DIRT2_INJECT_FAULT)
+
+RACE_SRCS := \
+	source/core/vecmath.c \
+	source/core/timestep.c \
+	source/race/track.c \
+	source/race/lap.c \
+	tests/test_race.c
+
+RACE_OBJS := $(patsubst %.c,$(RACE_BUILD)/%.o,$(RACE_SRCS))
+
+.PHONY: all test test-rates race-test test-all clean
 
 all: $(TARGET)
 
@@ -86,6 +119,15 @@ test-rates:
 		$(MAKE) -f Makefile.host BUILD=build-host-$$hz PHYSICS_HZ=$$hz test || exit 1; \
 	done
 
+# Builds and RUNS the race suite (tests/test_race.c), same "run it, don't
+# just link it" discipline as `test` above. See RACE_CFLAGS above for
+# DIRT2_INJECT_FAULT.
+race-test: $(RACE_TARGET)
+	./$(RACE_TARGET)
+
+# Combined "run everything" target -- both suites, physics first.
+test-all: test race-test
+
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
 
@@ -93,5 +135,12 @@ $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+$(RACE_TARGET): $(RACE_OBJS)
+	$(CC) $(RACE_CFLAGS) -o $@ $(RACE_OBJS) $(LDFLAGS)
+
+$(RACE_BUILD)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(RACE_CFLAGS) -c -o $@ $<
+
 clean:
-	rm -rf build-host build-host-60 build-host-100 build-host-120
+	rm -rf build-host build-host-60 build-host-100 build-host-120 build-host-race
