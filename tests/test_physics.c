@@ -44,6 +44,8 @@
 #include "vehicle/vehicle_params.h"
 #include "vehicle/suspension.h"
 #include "vehicle/tyre.h"
+#include "vehicle/tyre_lut.h"   /* tyre_lut_lookup -- probed directly by the
+                                  * non-finite-rho regression test           */
 #include "vehicle/drivetrain.h"
 #include "world/testground.h"
 #include "input/input.h"
@@ -152,12 +154,40 @@ static VehicleParams make_test_vehicle_params(void) {
     p.default_tyre_surface = make_test_tyre_surface();
     p.wheel_mass_moment_of_inertia = 1.2f;
     p.drivetrain = make_test_drivetrain_config();
+    /* Leaving these three unset is a CRASH, not a wrong number: a garbage
+     * slip_speed_floor makes the slip denominator NaN, rho NaN, and the tyre
+     * table index out of bounds. AddressSanitizer caught exactly that here,
+     * as a SEGV inside tyre_lut_lookup, the moment vehicle.c started reading
+     * these from VehicleParams instead of from its own local #defines. */
+    p.max_steer_angle  = 0.5236f;
+    p.slip_speed_floor = 1.0f;
+    p.handbrake_torque = 2600.0f;
     return p;
+}
+
+/* Fills the surface fields of a TestgroundConfig. Factored out so the two
+ * constructors below cannot diverge, and so that a THIRD constructor added
+ * later has an obvious thing to call. Harmless to omit today only because
+ * nothing in the sim calls testground_surface_at through these grounds --
+ * the moment one does, an omission here is uninitialised stack reaching the
+ * tyre model, which is the same class of bug that put a SEGV in
+ * tyre_lut_lookup during v0.1 integration. */
+static void fill_test_surfaces(TestgroundConfig *cfg) {
+    cfg->surface_tarmac.peak_mu         = 1.00f;
+    cfg->surface_tarmac.sliding_mu      = 0.75f;
+    cfg->surface_tarmac.peak_slip_ratio = 0.20f;
+    cfg->surface_tarmac.peak_slip_angle = 0.1396f;  /* 8 deg  */
+    cfg->surface_gravel.peak_mu         = 0.60f;
+    cfg->surface_gravel.sliding_mu      = 0.51f;
+    cfg->surface_gravel.peak_slip_ratio = 0.25f;
+    cfg->surface_gravel.peak_slip_angle = 0.2618f;  /* 15 deg */
+    cfg->surface_transition_length      = 6.0f;
 }
 
 static Testground make_flat_testground(f32 flat_length) {
     Testground tg;
     TestgroundConfig cfg;
+    fill_test_surfaces(&cfg);
     cfg.world_half_width = 25.0f;
     cfg.base_height = 0.0f;
     cfg.flat_length = flat_length;
@@ -174,6 +204,7 @@ static Testground make_flat_testground(f32 flat_length) {
 static Testground make_washboard_testground(void) {
     Testground tg;
     TestgroundConfig cfg;
+    fill_test_surfaces(&cfg);
     cfg.world_half_width = 25.0f;
     cfg.base_height = 0.0f;
     cfg.flat_length = 10.0f;
@@ -1234,9 +1265,90 @@ static void test_vehicle_stable_crossing_washboard_zone(void) {
     CHECK(max_quat_dev < 1e-4f, "orientation quaternion must stay unit-length while crossing the washboard");
 }
 
+/* A NaN rho must NOT index the tyre table. This is the regression test for a
+ * real SEGV found during v0.1 integration: NaN fails every comparison, so it
+ * passed straight through both of tyre_lut_lookup's range guards and reached
+ * (int)NaN, indexing catastrophically out of bounds. AddressSanitizer
+ * reported "SEGV on unknown address ... READ memory access" at
+ * tyre_lut.c:593. Without the guard this test does not fail politely -- it
+ * takes the whole suite down, which is exactly the point. */
+static void test_tyre_lut_survives_nonfinite_rho(void) {
+    float zero = 0.0f;
+    float nan_rho = zero / zero;          /* runtime NaN, not a constant the
+                                            * optimiser can fold away        */
+    float inf_rho = 1.0f / zero;
+    float v_nan = tyre_lut_lookup(TYRE_TUNING_ARCADE, TYRE_SURFACE_TARMAC_DRY, nan_rho);
+    float v_inf = tyre_lut_lookup(TYRE_TUNING_ARCADE, TYRE_SURFACE_TARMAC_DRY, inf_rho);
+    float v_neg = tyre_lut_lookup(TYRE_TUNING_ARCADE, TYRE_SURFACE_TARMAC_DRY, -5.0f);
+
+    CHECK(isfinite(v_nan), "tyre_lut_lookup must return a finite value for a NaN rho, not read out of bounds");
+    CHECK(isfinite(v_inf), "tyre_lut_lookup must return a finite value for an infinite rho");
+    CHECK(isfinite(v_neg), "tyre_lut_lookup must return a finite value for a negative rho");
+    CHECK(v_nan >= 0.0f && v_nan <= 1.0f, "tyre_lut_lookup's NaN fallback must be a real table value in 0..1");
+}
+
+/* Every field vehicle.c reads out of VehicleParams must actually be set by
+ * the constructors. Reads a fresh params through the same path the sim does
+ * and drives it -- an unset slip_speed_floor here reappears as the NaN that
+ * crashed the suite. */
+static void test_vehicle_params_are_fully_initialised(void) {
+    VehicleParams p = make_test_vehicle_params();
+
+    CHECK(isfinite(p.max_steer_angle) && p.max_steer_angle > 0.0f,
+          "VehicleParams.max_steer_angle must be set to a positive finite value");
+    CHECK(isfinite(p.slip_speed_floor) && p.slip_speed_floor > 0.0f,
+          "VehicleParams.slip_speed_floor must be set to a positive finite value (a zero or garbage floor makes slip NaN)");
+    CHECK(isfinite(p.handbrake_torque) && p.handbrake_torque > 0.0f,
+          "VehicleParams.handbrake_torque must be set to a positive finite value");
+    CHECK(p.handbrake_torque >= p.drivetrain.max_brake_torque,
+          "handbrake torque must be at least the footbrake's, or a handbrake pull cannot lock the rear");
+}
+
+/* The surface lookup must be TOTAL -- every query returns a usable surface,
+ * including out of bounds -- and must not step in grip. Before this existed,
+ * testground_surface_at was fully implemented, fully tested by its author,
+ * and reachable from nothing in the running game. */
+static void test_testground_surface_lookup_is_total_and_smooth(void) {
+    Testground ground = make_flat_testground(200.0f);
+    const TyreSurfaceParams *s;
+    f32 prev_mu = -1.0f;
+    f32 max_step = 0.0f;
+    int null_count = 0;
+    int z_i;
+
+    /* 0.01 m steps across the whole world plus well past both ends. */
+    for (z_i = -2000; z_i <= 25000; z_i += 1) {
+        f32 z = (f32)z_i * 0.01f;
+        s = testground_surface_at(&ground, 0.0f, z);
+        if (!s) { null_count++; continue; }
+        if (!isfinite(s->peak_mu) || s->peak_mu <= 0.0f) { null_count++; continue; }
+        if (prev_mu >= 0.0f) {
+            f32 step = fabsf(s->peak_mu - prev_mu);
+            if (step > max_step) max_step = step;
+        }
+        prev_mu = s->peak_mu;
+    }
+
+#if DIRT2_INJECT_FAULT == 30
+    null_count = 1;
+#endif
+    fprintf(stderr, "  (surface lookup: null_or_invalid=%d max_mu_step_per_cm=%.6f)\n",
+            null_count, (double)max_step);
+    CHECK(null_count == 0,
+          "testground_surface_at must return a valid surface for every query, including out of bounds");
+    /* A hard tarmac/gravel edge would be a 0.4 step in one sample. Anything
+     * under 0.01 per centimetre is a blend, not a cliff. */
+    CHECK(max_step < 0.01f,
+          "grip must blend across a surface boundary, not change in a single sample");
+}
+
 /*===================================================================================*/
 
 int run_physics_tests(void) {
+    test_tyre_lut_survives_nonfinite_rho();
+    test_vehicle_params_are_fully_initialised();
+    test_testground_surface_lookup_is_total_and_smooth();
+
     test_timestep_rate_is_compiled_in();
     test_timestep_init_zeroes_state();
 

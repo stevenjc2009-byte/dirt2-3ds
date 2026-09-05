@@ -183,18 +183,18 @@ void track_query(const Track *track, Vec3 world_pos, int *cached_segment,
     f32 best_dist_sq = -1.0f;
     f32 best_t = 0.0f;
     f32 best_cross = 0.0f;
-    int radius;
-    f32 fallback_limit;
     f32 seg_len, dist_along_lap, progress, dist, hw_a, hw_b;
 
-    if (start < 0 || start >= count) start = 0;
-
-    for (radius = 0; radius <= TRACK_SEARCH_RADIUS; radius++) {
-        int n_offsets = (radius == 0) ? 1 : 2;
-        int oi;
-        for (oi = 0; oi < n_offsets; oi++) {
-            int offset = (oi == 0) ? radius : -radius;
-            int seg = ((start + offset) % count + count) % count;
+    /* An out-of-range cache (TRACK_UNKNOWN_SEGMENT, or any other invalid
+     * value) means "the windowed search cannot be trusted" -- see this
+     * function's header comment -- so scan every segment instead of
+     * guessing a window. Cheap for this project's waypoint counts (tens,
+     * not the "hundreds" the header warns against), and only ever paid on
+     * the first query or right after a position discontinuity, never on
+     * every ordinary physics step. */
+    if (start < 0 || start >= count) {
+        int seg;
+        for (seg = 0; seg < count; seg++) {
             Vec3 a = track->waypoints[seg].center;
             Vec3 b = track->waypoints[(seg + 1) % count].center;
             f32 t, cross;
@@ -206,28 +206,24 @@ void track_query(const Track *track, Vec3 world_pos, int *cached_segment,
                 best_cross = cross;
             }
         }
-    }
-
-    /* Fallback full scan: only reached when the windowed search's best
-     * candidate is farther away than a quarter of the whole loop's length
-     * -- implausible for a car actually on or near the track, and the
-     * signature of a stale cache after a position discontinuity (car
-     * reset/teleport, see lap.h's lap_notify_reset). Self-scaling to the
-     * track's own size rather than a fixed metre constant, so this stays
-     * correct for a track of any size, not just the shipped example oval. */
-    fallback_limit = track->total_length * 0.25f;
-    if (best_dist_sq > fallback_limit * fallback_limit) {
-        int seg;
-        for (seg = 0; seg < count; seg++) {
-            Vec3 a = track->waypoints[seg].center;
-            Vec3 b = track->waypoints[(seg + 1) % count].center;
-            f32 t, cross;
-            f32 d2 = point_segment_dist_sq_xz(world_pos, a, b, &t, &cross);
-            if (d2 < best_dist_sq) {
-                best_dist_sq = d2;
-                best_seg = seg;
-                best_t = t;
-                best_cross = cross;
+    } else {
+        int radius;
+        for (radius = 0; radius <= TRACK_SEARCH_RADIUS; radius++) {
+            int n_offsets = (radius == 0) ? 1 : 2;
+            int oi;
+            for (oi = 0; oi < n_offsets; oi++) {
+                int offset = (oi == 0) ? radius : -radius;
+                int seg = ((start + offset) % count + count) % count;
+                Vec3 a = track->waypoints[seg].center;
+                Vec3 b = track->waypoints[(seg + 1) % count].center;
+                f32 t, cross;
+                f32 d2 = point_segment_dist_sq_xz(world_pos, a, b, &t, &cross);
+                if (best_dist_sq < 0.0f || d2 < best_dist_sq) {
+                    best_dist_sq = d2;
+                    best_seg = seg;
+                    best_t = t;
+                    best_cross = cross;
+                }
             }
         }
     }

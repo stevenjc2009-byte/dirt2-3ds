@@ -50,6 +50,10 @@
 #include "core/vecmath.h"
 
 #include <math.h>
+/* NULL. The 3DS build gets it free via libctru's include chain, so leaving
+ * this out still cross-compiles clean and only fails on the host build --
+ * exactly the kind of one-sided break the two-target split exists to catch. */
+#include <stddef.h>
 
 /*---------------------------------------------------------------------------------
  * PHASE 1 PLACEHOLDER CONSTANTS.
@@ -62,16 +66,11 @@
  * real fields for them. They are NOT tuned or playtested.
  *---------------------------------------------------------------------------------*/
 
-/* Radians of front-wheel steer at full Circle Pad deflection (InputState.steer
- * == +/-1). ~30 degrees. Belongs in VehicleParams eventually. */
-#define VEHICLE_MAX_STEER_ANGLE_RAD 0.5236f
-
-/* Longitudinal speed (m/s) below which the slip-ratio denominator is floored.
- * Slip ratio is (omega*R - v_long) / |v_long|, which is singular at rest;
- * every vehicle sim needs some form of low-speed guard here. A plain
- * denominator floor is the cheapest one and needs no extra per-wheel state
- * (a relaxation-length model would), which matters on a 268 MHz ARM11. */
-#define VEHICLE_SLIP_SPEED_FLOOR 1.0f
+/* VEHICLE_MAX_STEER_ANGLE_RAD and VEHICLE_SLIP_SPEED_FLOOR used to live here
+ * as unparameterised local constants. They are now real VehicleParams fields
+ * (max_steer_angle, slip_speed_floor) and these #defines are deliberately
+ * gone -- if you find a stray reference to either name, it is a leftover, not
+ * a fallback. */
 
 /* Slip ratio is clamped to +/- this before reaching tyre_solve. Past the
  * tyre curve's sliding tail the exact value carries no more information, and
@@ -147,10 +146,11 @@ static bool vehicle_wheel_is_driven(DriveLayout layout, WheelIndex wheel) {
  * Phase 1 is front-steer only, so the rear wheels are pinned to zero rather
  * than left at whatever they happened to hold.
  *---------------------------------------------------------------------------------*/
-static void vehicle_phase_steering(Wheel wheels[], const InputState *input) {
+static void vehicle_phase_steering(const VehicleParams *params, Wheel wheels[],
+                                    const InputState *input) {
     f32 steer = vehicle_clampf(input->steer, -1.0f, 1.0f);
-    wheels[WHEEL_FL].steer_angle = steer * VEHICLE_MAX_STEER_ANGLE_RAD;
-    wheels[WHEEL_FR].steer_angle = steer * VEHICLE_MAX_STEER_ANGLE_RAD;
+    wheels[WHEEL_FL].steer_angle = steer * params->max_steer_angle;
+    wheels[WHEEL_FR].steer_angle = steer * params->max_steer_angle;
     wheels[WHEEL_RL].steer_angle = 0.0f;
     wheels[WHEEL_RR].steer_angle = 0.0f;
 }
@@ -233,6 +233,8 @@ static void vehicle_phase_suspension(const VehicleParams *params,
 static void vehicle_phase_tyres(const VehicleParams *params,
                                  const Wheel wheels[],
                                  const RigidBody *chassis,
+                                 VehicleSurfaceQuery surface_query,
+                                 void *surface_userdata,
                                  WheelStepScratch scratch[]) {
     const f32 wheel_radius = params->drivetrain.wheel_radius;
     Vec3 chassis_forward = vec3_rotate_by_quat(vehicle_body_forward(), chassis->orientation);
@@ -274,7 +276,7 @@ static void vehicle_phase_tyres(const VehicleParams *params,
         v_lat  = vec3_dot(patch_velocity, lateral);
 
         denominator = fabsf(v_long);
-        if (denominator < VEHICLE_SLIP_SPEED_FLOOR) denominator = VEHICLE_SLIP_SPEED_FLOOR;
+        if (denominator < params->slip_speed_floor) denominator = params->slip_speed_floor;
 
         slip_ratio = (wheels[i].spin_velocity * wheel_radius - v_long) / denominator;
         slip_ratio = vehicle_clampf(slip_ratio, -VEHICLE_SLIP_RATIO_LIMIT,
@@ -286,7 +288,27 @@ static void vehicle_phase_tyres(const VehicleParams *params,
         slip.slip_ratio  = slip_ratio;
         slip.slip_angle  = slip_angle;
         slip.normal_load = s->normal_load;
-        force = tyre_solve(&params->default_tyre_surface, slip);
+
+        /* The surface is queried AT THIS WHEEL'S OWN CONTACT POINT, not at
+         * the chassis centre -- with a 2.6 m wheelbase the front wheels can
+         * be on tarmac while the rears are still on gravel, and that
+         * split-mu moment is most of what makes a surface change feel like
+         * anything. Querying once for the whole car would erase it.
+         *
+         * A NULL query, or one that returns NULL, falls back to the single
+         * default surface. That fallback is why this needs saying out loud:
+         * before this call existed, testground_surface_at was written,
+         * tested and reachable from nothing, so tarmac and gravel felt
+         * identical no matter what the world said. */
+        {
+            const TyreSurfaceParams *surface = NULL;
+            if (surface_query) {
+                surface = surface_query(surface_userdata,
+                                         s->contact_point.x, s->contact_point.z);
+            }
+            if (!surface) surface = &params->default_tyre_surface;
+            force = tyre_solve(surface, slip);
+        }
 
         s->tyre_fx = force.fx;
         s->tyre_force_world = vec3_add(vec3_scale(forward, force.fx),
@@ -417,10 +439,13 @@ static void vehicle_phase_wheel_spin(const VehicleParams *params,
         if (brake_torque < 0.0f) brake_torque = 0.0f;
         /* Handbrake is a rear-axle lock (input.h: "an abrupt, fully-on
          * rear-lock input for a rally-style pull"). drivetrain_update has no
-         * handbrake parameter, so vehicle.c owns this; max_brake_torque is
-         * reused rather than inventing a second unparameterised constant. */
+         * handbrake parameter, so vehicle.c owns this. It has its own torque
+         * rather than reusing max_brake_torque, and it is deliberately the
+         * larger of the two: a handbrake pull must reliably lock the rear
+         * even at a speed where the footbrake alone would not, or the pull
+         * does nothing and the rally-style rotation never happens. */
         if (input->handbrake && (i == WHEEL_RL || i == WHEEL_RR)) {
-            brake_torque += params->drivetrain.max_brake_torque;
+            brake_torque += params->handbrake_torque;
         }
 
         brake_delta = brake_torque * inv_inertia * dt;
@@ -468,6 +493,11 @@ void vehicle_init(Vehicle *v, const VehicleParams *params,
     v->drivetrain_state.engine_rpm = 0.0f;
     v->ground_query = ground_query;
     v->ground_userdata = ground_userdata;
+    /* NULL until the caller sets it (vehicle.h) -- every surface then reads
+     * as params.default_tyre_surface. Zeroed here rather than left as
+     * whatever the caller's stack held, because an uninitialised function
+     * pointer called once per wheel per step is a crash, not a wrong number. */
+    v->surface_query = NULL;
 }
 
 void vehicle_step(Vehicle *v, const InputState *input, f32 dt) {
@@ -481,14 +511,15 @@ void vehicle_step(Vehicle *v, const InputState *input, f32 dt) {
     /* step 0 (outside the numbered contract): this step's accumulators and
      * this step's steer angles. */
     rigidbody_clear_accumulators(&v->chassis);
-    vehicle_phase_steering(v->wheels, input);
+    vehicle_phase_steering(&v->params, v->wheels, input);
 
     /* steps 1-3, all four wheels */
     vehicle_phase_suspension(&v->params, v->wheels, &v->chassis,
                               v->ground_query, v->ground_userdata, dt, scratch);
 
     /* steps 4-5, all four wheels -- only now that every normal load is known */
-    vehicle_phase_tyres(&v->params, v->wheels, &v->chassis, scratch);
+    vehicle_phase_tyres(&v->params, v->wheels, &v->chassis,
+                         v->surface_query, v->ground_userdata, scratch);
 
     /* step 6 */
     vehicle_phase_apply_forces(&v->chassis, &v->params, v->wheels, scratch);

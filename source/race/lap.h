@@ -112,6 +112,13 @@ bool lap_update(LapState *state, Vec3 car_world_pos, f32 dt);
  * travelled" is not real driving and must not itself be read as visiting
  * the far side, nor as a crossing in either direction).
  *
+ * Also forces the next track_query (see track.h) to do a full scan rather
+ * than trust its segment cache -- a teleport can land anywhere relative to
+ * wherever the cache last pointed, including somewhere spatially close but
+ * far along the loop (e.g. the parallel side of a hairpin), which a
+ * windowed search would resolve to the WRONG segment instead of just a far
+ * one. See track_query's own header comment for the full reasoning.
+ *
  * Deliberately does NOT touch lap_count, current_lap_time, last_lap_time,
  * best_lap_time or total_time -- a reset mid-lap keeps the clock and the
  * tally exactly as they were; that is this module's design choice (a

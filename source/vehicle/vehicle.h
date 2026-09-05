@@ -163,6 +163,22 @@ typedef struct Wheel {
  * rather than passed into vehicleStep every call so the call site
  * (main.c's frame loop) doesn't have to thread world state through on every
  * single call. */
+/* "What am I driving on at world (x, z)?" -- the tyre-grip counterpart to
+ * SuspensionGroundQuery's "how high is the ground here?".
+ *
+ * A callback rather than a direct call into world/testground.h on purpose:
+ * vehicle/ must not depend on world/, or the physics core stops being
+ * testable without a world and the two layers grow into each other. The
+ * caller supplies the adapter (see main.c).
+ *
+ * MUST be total -- every query returns a valid surface, never NULL. If it is
+ * left NULL on the Vehicle itself, step 5 falls back to
+ * params.default_tyre_surface, which means every surface in the world feels
+ * identical. That is a legitimate configuration (the assertion suite uses
+ * it), but it is NOT the shipping one. */
+typedef const TyreSurfaceParams *(*VehicleSurfaceQuery)(void *userdata,
+                                                         f32 world_x, f32 world_z);
+
 typedef struct Vehicle {
     RigidBody chassis;
     Wheel wheels[VEHICLE_WHEEL_COUNT];      /* indexed by WheelIndex        */
@@ -171,6 +187,10 @@ typedef struct Vehicle {
 
     SuspensionGroundQuery ground_query;
     void *ground_userdata;
+
+    /* Optional; NULL means "use params.default_tyre_surface everywhere".
+     * Shares ground_userdata -- both queries answer about the same world. */
+    VehicleSurfaceQuery surface_query;
 } Vehicle;
 
 /* Sets up chassis (rigidbody_init from params.chassis_mass/inertia), zeroes

@@ -579,7 +579,21 @@ float tyre_lut_lookup(TyreTuning tuning, TyreSurface surface, float rho)
     float pos, frac;
     int i0;
 
-    if (rho <= 0.0f) {
+    /* Note the negated form: `!(rho > 0.0f)`, not `rho <= 0.0f`. Every
+     * comparison against a NaN is false, so a NaN rho fails this guard AND
+     * fails the `pos >= TYRE_LUT_SIZE - 1` clamp below, falls through both,
+     * and reaches `(int)pos` -- which for a NaN is undefined and in practice
+     * gives INT_MIN, indexing the table catastrophically out of bounds.
+     *
+     * Measured, not theorised: an uninitialised slip_speed_floor produced
+     * exactly this, and AddressSanitizer caught it right here as "SEGV on
+     * unknown address ... READ memory access". On the 3DS there is no
+     * sanitizer and no MMU trap -- it reads whatever happens to be at that
+     * address and drives on with a garbage grip value, or hangs the console.
+     *
+     * This is a backstop, not a licence: a NaN arriving here still means a
+     * caller computed a bad slip, and that caller is the real bug. */
+    if (!(rho > 0.0f)) {
         return table[0];
     }
 

@@ -78,6 +78,19 @@ static void make_placeholder_vehicle_params(VehicleParams *params) {
     params->drivetrain.idle_rpm = 900.0f;
     params->drivetrain.max_brake_torque = 1800.0f;
     params->drivetrain.wheel_radius = 0.30f;
+
+    /* These three MUST be set. vehicle.c used to hold them as local #defines
+     * and now reads them from here; leaving any of them as uninitialised
+     * stack is not a wrong-feeling car, it is a crash. A garbage
+     * slip_speed_floor makes the slip-ratio denominator NaN, which makes rho
+     * NaN, which indexes the tyre lookup table out of bounds -- caught by
+     * AddressSanitizer as a SEGV in tyre_lut_lookup during integration. */
+    params->max_steer_angle  = 0.5236f;   /* ~30 deg of front steer at full lock */
+    params->slip_speed_floor = 1.0f;      /* m/s; floors the slip denominator so
+                                            * it is not singular at rest        */
+    params->handbrake_torque = 2600.0f;   /* N*m; deliberately above
+                                            * max_brake_torque so a pull always
+                                            * locks the rear                    */
 }
 
 static void make_placeholder_testground_config(TestgroundConfig *config) {
@@ -134,6 +147,16 @@ static void make_placeholder_testground_config(TestgroundConfig *config) {
     }
 }
 
+/* Adapter: vehicle.h's VehicleSurfaceQuery -> world/testground.h's lookup.
+ * This thin function is the ONLY thing coupling the vehicle to the world;
+ * vehicle/ deliberately does not include world/ (see vehicle.h). Without it
+ * being installed on the Vehicle below, testground_surface_at is never called
+ * by anything and tarmac and gravel feel identical. */
+static const TyreSurfaceParams *main_surface_query(void *userdata,
+                                                    f32 world_x, f32 world_z) {
+    return testground_surface_at((const Testground *)userdata, world_x, world_z);
+}
+
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
 
@@ -146,6 +169,8 @@ int main(int argc, char *argv[]) {
     CameraConfig camera_config;
     Camera camera;
     Timestep timestep;
+    Vec3 wheel_offsets[VEHICLE_WHEEL_COUNT];
+    int i;
     bool running = true;
 
     make_placeholder_testground_config(&ground_config);
@@ -153,7 +178,21 @@ int main(int argc, char *argv[]) {
 
     make_placeholder_vehicle_params(&params);
     vehicle_init(&car, &params, testground_height_query, &testground);
+    /* vehicle_init leaves this NULL on purpose (vehicle.h). Setting it is
+     * what makes the ground's tarmac/gravel zones actually reach the tyre
+     * model -- leave it out and the whole surface system is dead code that
+     * still compiles and still passes its own tests. */
+    car.surface_query = main_surface_query;
     car.chassis.position = vec3_make(0.0f, 1.0f, 0.0f);
+
+    /* Body-space wheel positions for the renderer, taken from the SAME
+     * suspension mount points the physics raycasts from -- not re-typed as
+     * literals here. If the two ever disagree, the car is drawn with its
+     * wheels somewhere the simulation says they are not, and every
+     * suspension bug becomes impossible to read off the screen. */
+    for (i = 0; i < VEHICLE_WHEEL_COUNT; i++) {
+        wheel_offsets[i] = params.suspension[i].mount_point_body;
+    }
 
     input_config.circlepad_deadzone = 0.15f;
     input_config.circlepad_radius = 156.0f;
@@ -161,6 +200,16 @@ int main(int argc, char *argv[]) {
     input_config.throttle_release_rate = 3.0f;
     input_config.brake_ramp_rate = 4.0f;
     input_config.brake_release_rate = 3.0f;
+    /* These two were the landmine. input.c raises the stick fraction to
+     * steer_response_exponent, and fraction^0 == 1.0 -- so leaving this field
+     * unset gave INSTANT FULL STEERING LOCK from the smallest deflection.
+     * input.c now clamps a garbage value to a sane default, but setting it
+     * here explicitly is what makes the intent visible: 1.6 gives fine
+     * control near centre and full lock at the rim, which is what a Circle
+     * Pad needs. steer_return_rate rate-limits the return to centre on
+     * release (steering IN, and countersteer, stay instant). */
+    input_config.steer_response_exponent = 1.6f;
+    input_config.steer_return_rate = 8.0f;
     input_init(&input);
 
     camera_config.follow_distance = 6.0f;
@@ -245,16 +294,16 @@ int main(int argc, char *argv[]) {
         renderer_frame_begin(&camera);
         debugdraw_frame_begin();
 
-        /* Phase 1 has no real car/world mesh or draw-mesh entry point yet --
-         * renderer.h exposes only the frame_begin/end + camera bracket, and
-         * neither camera.h nor world/testground.h declares anything to draw
-         * a mesh with. debugdraw.h's wireframe/point/text primitives are the
-         * only real draw calls available, and are exactly what its own
-         * header says they exist for: making suspension/tyre behaviour
-         * "visible and verifiable on real hardware" for Phase 1. */
-        debugdraw_wire_box(car.chassis.position, vec3_make(1.0f, 0.5f, 2.2f),
-                            0xFFFFFFFF);
+        /* Solid geometry first: the ground patch around the camera, then the
+         * car. Both cull back faces and restore CULL_NONE on the way out, so
+         * debugdraw's ribbon quads below still draw from either side. */
+        renderer_draw_ground(&testground, camera.position);
+        renderer_draw_vehicle(car.chassis.position, car.chassis.orientation,
+                               wheel_offsets);
 
+        /* debugdraw on top -- contact points and normals. Not decoration:
+         * these are how a wrong suspension or a wheel floating off the
+         * surface is spotted on hardware, where there is no debugger. */
         for (i = 0; i < VEHICLE_WHEEL_COUNT; i++) {
             const SuspensionState *wheel_state = &car.wheels[i].suspension;
             if (wheel_state->grounded) {

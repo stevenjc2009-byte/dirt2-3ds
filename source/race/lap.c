@@ -40,7 +40,7 @@ static bool crosses_far_side(f32 prev_progress, f32 progress) {
 
 void lap_init(LapState *state, const Track *track) {
     state->track = track;
-    state->cached_segment = 0;
+    state->cached_segment = TRACK_UNKNOWN_SEGMENT;
     state->primed = false;
     state->prev_progress = 0.0f;
     state->far_side_reached = false;
@@ -54,11 +54,10 @@ void lap_init(LapState *state, const Track *track) {
 void lap_notify_reset(LapState *state) {
     state->primed = false;
     state->far_side_reached = false;
-    /* cached_segment is deliberately left alone: track_query's own
-     * fallback full-scan (track.c) recovers from a stale cache after a
-     * real teleport; zeroing it here would just make the NEXT query
-     * search outward from a possibly-wrong place instead of the possibly-
-     * wrong place it already had. */
+    /* Force the next track_query to do a full scan instead of trusting a
+     * windowed search from wherever the car used to be -- see track.h's
+     * track_query comment and this header's lap_notify_reset comment. */
+    state->cached_segment = TRACK_UNKNOWN_SEGMENT;
 }
 
 bool lap_update(LapState *state, Vec3 car_world_pos, f32 dt) {

@@ -52,6 +52,12 @@ extern "C" {
  * grow. */
 #define TRACK_MAX_WAYPOINTS 64
 
+/* Pass this as the initial *cached_segment (or store it after
+ * lap_notify_reset, see lap.h) to force track_query's NEXT call to do a
+ * full scan instead of trusting a windowed search -- see track_query's
+ * comment for exactly when this matters. */
+#define TRACK_UNKNOWN_SEGMENT (-1)
+
 /* One point on the track's centreline plus the track's half-width there.
  * Y is stored (so a caller can reuse Vec3 wholesale) but is NOT read by any
  * query in this module -- see file header. */
@@ -117,10 +123,21 @@ void track_build_example_oval(Track *track);
  *
  * `*cached_segment` is caller-owned state (e.g. embedded in LapState, see
  * lap.h) that persists BETWEEN calls -- pass the value this function wrote
- * last time, and it searches outward from there instead of scanning every
- * segment. Any out-of-range value (including on the very first call, e.g.
- * 0) is accepted and clamped in. Always updated to the segment this call
- * actually found, ready to seed the next call. */
+ * last time, and it searches a small window outward from there instead of
+ * scanning every segment. Always updated to the segment this call actually
+ * found, ready to seed the next call.
+ *
+ * A windowed search is only valid when the cache is a genuinely warm guess
+ * -- i.e. world_pos has moved continuously (at most a handful of segments)
+ * since the position that produced it. Pass TRACK_UNKNOWN_SEGMENT (or any
+ * other out-of-range value) to force a full scan instead: required on the
+ * very first call on a fresh cache, and after any caller-side position
+ * DISCONTINUITY (a car reset/teleport -- see lap.h's lap_notify_reset).
+ * Trusting a windowed search off a stale or arbitrary cache after a jump
+ * can silently return the wrong segment (and therefore wrong progress) if
+ * the jumped-to position happens to be spatially close to -- but far along
+ * the loop from -- wherever the stale cache pointed, e.g. a point on one
+ * side of a hairpin versus the straight running back past it. */
 void track_query(const Track *track, Vec3 world_pos, int *cached_segment,
                   TrackQueryResult *out);
 
