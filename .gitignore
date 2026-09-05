@@ -9,3 +9,4 @@ build-host-120/
 *.cia
 *.o
 *.d
+*.banner

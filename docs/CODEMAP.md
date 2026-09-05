@@ -108,10 +108,11 @@ the three ordering bugs this sequence prevents.
 - **3DS target** (`Makefile`): devkitPro MSYS2 shell only.
   `export DEVKITARM=/opt/devkitpro/devkitARM` (devkitPro's MSYS2 sets this
   itself), then `make` from the `dirt2/` directory. Produces `dirt2.3dsx`
-  (and `dirt2.elf`/`dirt2.smdh`). `make cia` additionally needs
-  `dirt2.rsf`, `cia/banner.png` and `cia/banner.wav`, none of which exist
-  yet -- see the Makefile's `cia:` section comment for why those were not
-  fabricated for this task.
+  (and `dirt2.elf`/`dirt2.smdh`). `make cia` additionally builds
+  `dirt2.cia`, and needs `dirt2.rsf` (copied from raytracer3ds's spec, which
+  came from Universal-Updater's known-good one) plus `cia/banner.png` and
+  `cia/banner.wav` (placeholder art, regenerate with
+  `python meta/make_assets.py`). All three exist as of the v1.0.0 release.
 - **Host physics test build** (`Makefile.host`): WSL only, plain system
   `gcc`, zero 3DS dependencies. `make -f Makefile.host clean test` builds
   and runs the suite once at the default 120 Hz; `make -f Makefile.host
