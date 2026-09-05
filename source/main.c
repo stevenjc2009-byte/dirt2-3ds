@@ -53,8 +53,31 @@ static void make_placeholder_vehicle_params(VehicleParams *params) {
         params->suspension[i].damper_compression = 3000.0f;
         params->suspension[i].damper_rebound = 4500.0f;
         params->suspension[i].bottom_out_spring_rate = 200000.0f;
-        params->suspension[i].mount_point_body = vec3_zero();
     }
+
+    /* Wheel geometry. This USED to be vec3_zero() for all four, which put
+     * every suspension raycast at the chassis origin: no wheelbase, no track,
+     * so the car had no pitch or roll response at all (it pogoed on a single
+     * point) and the renderer drew all four wheel boxes stacked inside the
+     * body. That is not a tuning choice, it is a car with no wheels in the
+     * places its wheels are.
+     *
+     * Body axes are x forward, y up, z right (vehicle.c:115). The numbers are
+     * the 2.55 m wheelbase / 1.6 m track already recommended in
+     * vehicle_params.h's mount_point_body note: +-1.275 fore/aft, +-0.8
+     * left/right.
+     *
+     * y = -0.25 is this file's call, since vehicle_params.h leaves the height
+     * to "whoever places the chassis mesh's origin" and that is here. Static
+     * spring compression is (mass/4)*g/k = 300*9.81/35000 = 0.084 m, so the
+     * settled chassis origin ends up at 0.25 + (0.30 - 0.084) = 0.466 m above
+     * the ground -- a plausible centre-of-mass height that also keeps the
+     * renderer's chassis box clear of the surface. With y = 0 the origin would
+     * settle at 0.216 m and the body box would be drawn half-buried. */
+    params->suspension[WHEEL_FL].mount_point_body = vec3_make( 1.275f, -0.25f, -0.8f);
+    params->suspension[WHEEL_FR].mount_point_body = vec3_make( 1.275f, -0.25f,  0.8f);
+    params->suspension[WHEEL_RL].mount_point_body = vec3_make(-1.275f, -0.25f, -0.8f);
+    params->suspension[WHEEL_RR].mount_point_body = vec3_make(-1.275f, -0.25f,  0.8f);
 
     params->antiroll_rate[AXLE_FRONT] = 15000.0f;
     params->antiroll_rate[AXLE_REAR] = 10000.0f;
@@ -157,6 +180,35 @@ static const TyreSurfaceParams *main_surface_query(void *userdata,
     return testground_surface_at((const Testground *)userdata, world_x, world_z);
 }
 
+/* Where the car starts, and which way it points. A separate function rather
+ * than two lines inline in main() so a host probe can call the SHIPPED start
+ * pose instead of re-typing it: a probe that hard-codes these numbers keeps
+ * passing while this file drifts, which is exactly the failure it exists to
+ * catch. Both things it sets are load-bearing:
+ *
+ * POSITION. testground.h places its three zones along +Z starting at Z=0
+ * (flat 0..40, hills 40..100, washboard 100..140) and bounds the world to
+ * X in [-25, +25]. testground_query returns false outside that, which the
+ * vehicle reads as "no ground" -- so a car that leaves the box falls forever.
+ * Z = 5 starts it 5 m into the flat zone with the whole 140 m run ahead.
+ * Y = 1.0 is above the settled ride height (0.466 m, see the mount-point
+ * comment above), so the car drops ~0.5 m and settles on its springs at boot:
+ * a free, obvious check that gravity and the suspension are both alive.
+ *
+ * ORIENTATION. The car's body forward is +X (vehicle.c:115) but the test
+ * ground runs along +Z, so an unrotated car drives into the world's 25 m side
+ * wall in a couple of seconds and never sees the hills at all. A -90 degree
+ * yaw about +Y maps body +X onto world +Z -- the sign was confirmed by
+ * running quat_from_axis_angle/vec3_rotate_by_quat, not reasoned about, since
+ * it depends on this project's own handedness:
+ *     yaw=+90 -> forward=(0, 0, -1)
+ *     yaw=-90 -> forward=(0, 0, +1)   <- this one                          */
+static void place_car_at_start(Vehicle *car) {
+    car->chassis.position = vec3_make(0.0f, 1.0f, 5.0f);
+    car->chassis.orientation =
+        quat_from_axis_angle(vec3_make(0.0f, 1.0f, 0.0f), -1.5707963f);
+}
+
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
 
@@ -170,7 +222,6 @@ int main(int argc, char *argv[]) {
     Camera camera;
     Timestep timestep;
     Vec3 wheel_offsets[VEHICLE_WHEEL_COUNT];
-    int i;
     bool running = true;
 
     make_placeholder_testground_config(&ground_config);
@@ -183,16 +234,7 @@ int main(int argc, char *argv[]) {
      * model -- leave it out and the whole surface system is dead code that
      * still compiles and still passes its own tests. */
     car.surface_query = main_surface_query;
-    car.chassis.position = vec3_make(0.0f, 1.0f, 0.0f);
-
-    /* Body-space wheel positions for the renderer, taken from the SAME
-     * suspension mount points the physics raycasts from -- not re-typed as
-     * literals here. If the two ever disagree, the car is drawn with its
-     * wheels somewhere the simulation says they are not, and every
-     * suspension bug becomes impossible to read off the screen. */
-    for (i = 0; i < VEHICLE_WHEEL_COUNT; i++) {
-        wheel_offsets[i] = params.suspension[i].mount_point_body;
-    }
+    place_car_at_start(&car);
 
     input_config.circlepad_deadzone = 0.15f;
     input_config.circlepad_radius = 156.0f;
@@ -215,7 +257,21 @@ int main(int argc, char *argv[]) {
     camera_config.follow_distance = 6.0f;
     camera_config.follow_height = 2.5f;
     camera_config.look_ahead_height = 1.0f;
-    camera_config.position_smoothing = 0.15f;
+    /* This is a PER-SECOND blend factor (camera.h:41), not a per-frame one:
+     * camera.c turns it into t = 1 - (1 - s)^dt, so the exponential time
+     * constant is -1/ln(1 - s). An exponential follow lags a car moving at
+     * constant speed by exactly speed * tau, forever -- it never catches up.
+     *
+     * The 0.15 that used to be here reads like a per-frame lerp factor and is
+     * a catastrophe as a per-second one: tau = -1/ln(0.85) = 6.15 s, i.e. 98 m
+     * behind at 16 m/s and 215 m behind at 35 m/s. Measured in Azahar, both:
+     * the car left the top screen entirely and was a red dot against the sky.
+     *
+     * 0.98 gives tau = -1/ln(0.02) = 0.256 s, so the trailing distance is
+     * 6 m + speed * 0.256 -- about 10 m at 16 m/s and 15 m at 35 m/s. The
+     * camera easing back as the car gains speed is the behaviour a chase cam
+     * wants anyway; it just has to be metres, not hundreds of metres. */
+    camera_config.position_smoothing = 0.98f;
     camera_config.fov_degrees = 55.0f;
     camera_config.near_clip = 0.1f;
     camera_config.far_clip = 500.0f;
@@ -238,8 +294,23 @@ int main(int argc, char *argv[]) {
     u64 last_tick = svcGetSystemTick();
 #endif
 
+    /* The pose the car had one physics step ago, kept ACROSS frames so a
+     * render frame that owes zero physics steps (physics is 120 Hz, VBlank is
+     * ~59.83 Hz, so the step count per frame is 2 most frames and 3
+     * occasionally) still has something to interpolate from.
+     *
+     * This lives in main.c rather than as two new fields on RigidBody
+     * deliberately: RigidBody has no notion of render frames, nothing in the
+     * physics needs a previous pose, and rigidbody.h is a shared header that
+     * three other modules and both test suites include. Keeping the render
+     * concern in the render loop costs two locals and touches nobody. */
+    Vec3 prev_pos = car.chassis.position;
+    Quat prev_orient = car.chassis.orientation;
+
     while (running) {
-        f32 frame_dt;
+        f32 frame_dt, alpha;
+        Vec3 draw_pos;
+        Quat draw_orient;
         uint32_t steps, i;
 
 #ifdef __3DS__
@@ -278,6 +349,14 @@ int main(int argc, char *argv[]) {
 
         steps = timestep_advance(&timestep, frame_dt);
         for (i = 0; i < steps; i++) {
+            /* Snapshot INSIDE the loop, not before it: on a catch-up frame
+             * that runs several steps, the pose to interpolate from is the
+             * one before the LAST step, not the one at the top of the frame.
+             * Snapshotting outside would make the car visibly rubber-band
+             * every time the step count changed. */
+            prev_pos = car.chassis.position;
+            prev_orient = car.chassis.orientation;
+
             /* input.h's contract: input_update runs once per physics step,
              * immediately before that step's vehicle_step, with
              * dt == PHYSICS_DT -- see input.h's input_update comment on why
@@ -288,8 +367,22 @@ int main(int argc, char *argv[]) {
             vehicle_step(&car, &input, PHYSICS_DT);
         }
 
-        camera_update(&camera, &camera_config, car.chassis.position,
-                      car.chassis.orientation, frame_dt);
+        /* The interpolated draw pose camera.h and renderer.h both ask for.
+         * timestep_get_alpha is the leftover accumulator as a fraction of one
+         * step, so the frame is rendered `alpha` of the way from the
+         * second-to-last completed step to the last one -- one step in the
+         * past, but smooth. Drawing the raw physics pose instead judders
+         * whenever the step count per frame changes, which at 120 Hz physics
+         * against a 59.83 Hz VBlank it periodically does.
+         *
+         * The SAME pose goes to the camera and to the car. Passing the raw
+         * pose to one and the interpolated pose to the other would make the
+         * car shimmer against its own chase camera. */
+        alpha = timestep_get_alpha(&timestep);
+        draw_pos = vec3_lerp(prev_pos, car.chassis.position, alpha);
+        draw_orient = quat_slerp(prev_orient, car.chassis.orientation, alpha);
+
+        camera_update(&camera, &camera_config, draw_pos, draw_orient, frame_dt);
 
         renderer_frame_begin(&camera);
         debugdraw_frame_begin();
@@ -297,9 +390,29 @@ int main(int argc, char *argv[]) {
         /* Solid geometry first: the ground patch around the camera, then the
          * car. Both cull back faces and restore CULL_NONE on the way out, so
          * debugdraw's ribbon quads below still draw from either side. */
+        /* Body-space wheel centres, rebuilt every frame from the SAME
+         * suspension state the physics just wrote -- not re-typed literals,
+         * and not the static mount points either.
+         *
+         * The mount point is where the raycast STARTS; the wheel hangs below
+         * it by the spring's current length (rest_length shortens by
+         * `compression`, see suspension.h), and the wheel's centre is one
+         * radius back up from where it touches. Drawing at the raw mount
+         * point instead buries every wheel by the static spring compression
+         * (8 cm on this car) and, worse, makes the suspension invisible: the
+         * wheels would ride rigidly with the body over the washboard section
+         * instead of moving in their arches, which is the one thing a
+         * suspension bug shows up in. */
+        for (i = 0; i < VEHICLE_WHEEL_COUNT; i++) {
+            const SuspensionConfig *sc = &params.suspension[i];
+            f32 hang = sc->rest_length - car.wheels[i].suspension.compression
+                       - params.drivetrain.wheel_radius;
+            wheel_offsets[i] = vec3_sub(sc->mount_point_body,
+                                        vec3_make(0.0f, hang, 0.0f));
+        }
+
         renderer_draw_ground(&testground, camera.position);
-        renderer_draw_vehicle(car.chassis.position, car.chassis.orientation,
-                               wheel_offsets);
+        renderer_draw_vehicle(draw_pos, draw_orient, wheel_offsets);
 
         /* debugdraw on top -- contact points and normals. Not decoration:
          * these are how a wrong suspension or a wheel floating off the

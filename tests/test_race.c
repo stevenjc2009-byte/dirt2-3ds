@@ -85,7 +85,8 @@ static Vec3 sample_track_position(const Track *track, f32 lap_fraction) {
  * the naive thing an first-draft crossing test looks like, kept here (not
  * in lap.c) purely to be run side-by-side against the real LapState on the
  * exact same trajectory and show it gets the wrong answer -- see
- * test_reverse_crossing_counts_zero and test_out_and_back_counts_zero. */
+ * test_reverse_crossing_counts_zero, test_out_and_back_counts_zero, and
+ * test_back_and_forth_counts_zero. */
 static int naive_crossing_count(const f32 *progress, int n) {
     int count = 0;
     int i;
@@ -230,6 +231,69 @@ static void test_out_and_back_counts_zero(const Track *track) {
     CHECK(naive_crossing_count(progress_samples, n_samples) >= 1,
           "sanity: this trajectory crosses the line (a naive any-direction "
           "crossing counter wrongly reports it as a lap)");
+}
+
+/* ---- lap.c: back-and-forth over the line (reverse across it, THEN forward
+ * across it again) counts zero -- specifically exercises the far-side gate
+ * on a FORWARD wrap, unlike the two tests above.
+ *
+ * test_reverse_crossing_counts_zero's only crossing is a BACKWARD wrap, and
+ * test_out_and_back_counts_zero's only crossing is also a BACKWARD wrap
+ * (forward a little with no wrap at all, then back across the line) -- the
+ * far-side gate (lap.c's `gate_open`) is only ever read inside the FORWARD
+ * wrap branch, so neither of those trajectories can tell a correctly-gated
+ * forward wrap apart from an ungated one (DIRT2_INJECT_FAULT=1 removes the
+ * gate entirely and both of those tests still pass). This test's second leg
+ * -- forward again, back across the line -- is a genuine forward wrap with
+ * far_side_reached still false (the car never went anywhere near the
+ * midpoint), so it is the one trajectory here that actually goes red under
+ * DIRT2_INJECT_FAULT=1. */
+
+static void test_back_and_forth_counts_zero(const Track *track) {
+    LapState lap;
+    const int back_steps = seconds_to_steps(0.5f);
+    const int forward_steps = seconds_to_steps(0.5f);
+    f32 progress_samples[256];
+    int n_samples = 0;
+    int i;
+
+    lap_init(&lap, track);
+    /* Prime just past the line, nowhere near the far side. */
+    progress_samples[n_samples++] = 0.02f;
+    lap_update(&lap, sample_track_position(track, 0.02f), PHYSICS_DT);
+
+    /* Leg 1: reverse across the line (a BACKWARD wrap -- must not count,
+     * and must not touch far_side_reached). */
+    for (i = 1; i <= back_steps; i++) {
+        f32 lap_fraction = 0.02f - 0.06f * (f32)i / (f32)back_steps; /* -> ~-0.04 */
+        Vec3 pos = sample_track_position(track, lap_fraction);
+        TrackQueryResult q;
+        int dummy_cache = 0;
+        track_query(track, pos, &dummy_cache, &q);
+        if (n_samples < 256) progress_samples[n_samples++] = q.progress;
+        lap_update(&lap, pos, PHYSICS_DT);
+    }
+    CHECK(lap.lap_count == 0, "reversing across the line must not count as a lap");
+
+    /* Leg 2: forward again, back across the line (a FORWARD wrap -- the one
+     * this module's far-side gate must catch, since the car still hasn't
+     * been anywhere near the midpoint). */
+    for (i = 1; i <= forward_steps; i++) {
+        f32 lap_fraction = -0.04f + 0.06f * (f32)i / (f32)forward_steps; /* -> ~0.02 */
+        Vec3 pos = sample_track_position(track, lap_fraction);
+        TrackQueryResult q;
+        int dummy_cache = 0;
+        track_query(track, pos, &dummy_cache, &q);
+        if (n_samples < 256) progress_samples[n_samples++] = q.progress;
+        lap_update(&lap, pos, PHYSICS_DT);
+    }
+
+    CHECK(lap.lap_count == 0,
+          "a forward crossing after a reverse crossing, still nowhere near the far side, "
+          "must not count as a lap");
+    CHECK(naive_crossing_count(progress_samples, n_samples) >= 2,
+          "sanity: this trajectory crosses the line twice (a naive any-direction "
+          "crossing counter wrongly reports two laps)");
 }
 
 /* ---- lap.c: best time only updates on improvement ---- */
@@ -447,6 +511,7 @@ int main(void) {
     test_clean_lap_counts_one(&track);
     test_reverse_crossing_counts_zero(&track);
     test_out_and_back_counts_zero(&track);
+    test_back_and_forth_counts_zero(&track);
     test_best_time_updates_on_improvement(&track);
     test_dt_driven_timing(&track);
     test_same_step_completion(&track);

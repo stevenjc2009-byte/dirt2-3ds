@@ -138,9 +138,24 @@ static int s_ground_vert_count = 0;
  * art/dimensions exist -- nothing in vehicle_params.h specifies visual
  * chassis dimensions yet, so these are owned entirely by render, not read
  * from anywhere. */
-#define RENDERER_CHASSIS_HALF_X 2.00f /* half-length, forward/back   */
-#define RENDERER_CHASSIS_HALF_Y 0.55f /* half-height                 */
-#define RENDERER_CHASSIS_HALF_Z 0.85f /* half-width, left/right      */
+/* HALF_Z MUST STAY BELOW THE WHEEL TRACK. main.c mounts the wheels at
+ * z = +-0.8; the first version of this box was 0.85 half-width, so the body
+ * was WIDER than the track and swallowed all four wheels whole. The first
+ * Azahar boot that rendered anything at all showed a plain red brick with two
+ * black slivers barely poking out of its side. 0.70 leaves 10 cm of each
+ * wheel proud of the bodywork, which is what makes suspension travel
+ * something you can see rather than something you infer.
+ *
+ * CENTER_Y offsets the box UP from the chassis origin, which is the centre of
+ * MASS -- not the centre of the visible body. At half_y 0.45 and no offset
+ * the box straddled the CoM (0.466 m when settled, see main.c) and its
+ * underside sat below the ground plane. +0.30 puts the body's underside at
+ * ~0.32 m with its roof at ~1.22 m, sitting on top of the wheels instead of
+ * through them. */
+#define RENDERER_CHASSIS_HALF_X  1.90f /* half-length, forward/back   */
+#define RENDERER_CHASSIS_HALF_Y  0.45f /* half-height                 */
+#define RENDERER_CHASSIS_HALF_Z  0.70f /* half-width, left/right      */
+#define RENDERER_CHASSIS_CENTER_Y 0.30f /* body-space lift above the CoM */
 #define RENDERER_WHEEL_HALF_X   0.30f /* wheel radius, in the plane containing forward+up */
 #define RENDERER_WHEEL_HALF_Y   0.30f /* wheel radius, in the plane containing forward+up */
 #define RENDERER_WHEEL_HALF_Z   0.12f /* half-width, along the spin axis (right) */
@@ -261,12 +276,40 @@ void renderer_frame_begin(const Camera *cam) {
                FVec3_New(cam->target.x, cam->target.y, cam->target.z),
                FVec3_New(0.0f, 1.0f, 0.0f), /* world up, see camera.c */
                false);
-    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uloc_modelview, &view);
 
     C3D_FrameBegin(C3D_FRAME_SYNCDRAW); /* the real GPU wait -- see file
         header; C3D_FrameSync alone only waits for VBLANK. */
     C3D_RenderTargetClear(s_target, C3D_CLEAR_ALL, DIRT2_CLEAR_COLOR, 0);
     C3D_FrameDrawOn(s_target);
+
+    /* REBIND THE 3D PROGRAM AND RE-UPLOAD BOTH UNIFORMS, EVERY FRAME.
+     *
+     * This is not defensive tidying, it is the fix for a total 3D blackout.
+     * The first version of this file bound s_shader exactly once, in
+     * renderer_init, and uploaded `projection` there as a one-off "it never
+     * changes" optimisation. Two things then bind citro2d's OWN shader
+     * program over it and never put it back:
+     *   1. C2D_Init(), called LATER in renderer_init than C3D_BindProgram,
+     *      so the very first frame was already drawing against the wrong
+     *      program; and
+     *   2. C2D_Prepare(), which debugdraw_frame_end calls every frame for
+     *      its text pass (see debugdraw.c's own note that C2D_Prepare
+     *      clobbers citro3d state).
+     * PICA float uniforms live in the vertex shader's register file, so
+     * writing s_uloc_projection/s_uloc_modelview while citro2d's program is
+     * bound writes citro2d's registers, not ours. The observable symptom is
+     * exactly what a boot in Azahar showed: 60 FPS, correct dt/steps/alpha
+     * text, and not one pixel of ground, car or debug marker -- the 2D text
+     * being the only thing drawn by the program that was actually bound.
+     *
+     * The depth test goes back too. C2D_Prepare sets its own, so the
+     * GPU_GEQUAL/GPU_WRITE_ALL configured in renderer_init survives only
+     * until debugdraw's first text pass. Cull and blend are re-set by each
+     * draw call already; these two are not. */
+    C3D_BindProgram(&s_shader);
+    C3D_DepthTest(true, GPU_GEQUAL, GPU_WRITE_ALL);
+    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uloc_projection, &s_projection);
+    C3D_FVUnifMtx4x4(GPU_VERTEX_SHADER, s_uloc_modelview, &view);
 #else
     (void)cam;
 #endif
@@ -513,7 +556,12 @@ void renderer_draw_vehicle(Vec3 chassis_pos, Quat chassis_orient,
 
     s_vehicle_vert_count = 0;
 
-    push_box(chassis_pos, chassis_half, chassis_orient, chassis_color, light_dir);
+    /* The body box is lifted along the chassis's OWN up axis, not world +Y,
+     * so it stays planted on the car when the car pitches or rolls. */
+    push_box(vec3_add(chassis_pos,
+                      vec3_rotate_by_quat(vec3_make(0.0f, RENDERER_CHASSIS_CENTER_Y, 0.0f),
+                                          chassis_orient)),
+             chassis_half, chassis_orient, chassis_color, light_dir);
     for (i = 0; i < VEHICLE_WHEEL_COUNT; i++) {
         Vec3 wheel_center = vec3_add(chassis_pos,
             vec3_rotate_by_quat(wheel_local_offsets[i], chassis_orient));
