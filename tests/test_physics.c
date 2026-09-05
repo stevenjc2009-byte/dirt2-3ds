@@ -1342,6 +1342,92 @@ static void test_testground_surface_lookup_is_total_and_smooth(void) {
           "grip must blend across a surface boundary, not change in a single sample");
 }
 
+/* Steering direction. This is the one defect in v1.0.0 that steve found on
+ * hardware in under a minute and that every one of the 65 checks here missed:
+ * the car steered exactly backwards. Nothing in the suite asserted WHICH WAY
+ * it turned, only that it turned without exploding.
+ *
+ * "Right" is not asserted from a convention written in a comment somewhere --
+ * it is taken from the car's own geometry, the side the front-right wheel is
+ * mounted on. If those mounts are ever swapped, the first CHECK reports it
+ * rather than letting the test quietly redefine correct along with the bug. */
+static void test_vehicle_steers_toward_the_side_the_input_asks_for(void) {
+    Testground ground = make_flat_testground(400.0f);
+    VehicleParams params = make_test_vehicle_params();
+    const f32 half_wheelbase = 1.275f;
+    const f32 half_track = 0.800f;
+    const int settle_steps = (int)(2.0f * PHYSICS_HZ);
+    const int turn_steps = (int)(2.0f * PHYSICS_HZ);
+    f32 dot_right = 0.0f, dot_left = 0.0f;
+    int arm;
+
+    /* make_test_suspension_config leaves every mount at the body origin, which
+     * is fine for a settle test and useless for a steering one: a car with no
+     * track and no wheelbase has no geometry to turn about. */
+    params.suspension[WHEEL_FL].mount_point_body = vec3_make(+half_wheelbase, 0.0f, -half_track);
+    params.suspension[WHEEL_FR].mount_point_body = vec3_make(+half_wheelbase, 0.0f, +half_track);
+    params.suspension[WHEEL_RL].mount_point_body = vec3_make(-half_wheelbase, 0.0f, -half_track);
+    params.suspension[WHEEL_RR].mount_point_body = vec3_make(-half_wheelbase, 0.0f, +half_track);
+
+    CHECK(params.suspension[WHEEL_FR].mount_point_body.z >
+          params.suspension[WHEEL_FL].mount_point_body.z,
+          "test setup: the front-right wheel must sit at a larger z than the front-left");
+
+    /* Two arms, full lock each way. One arm alone passes just as happily on a
+     * car that cannot steer at all, because it only has to clear a threshold
+     * in one direction. */
+    for (arm = 0; arm < 2; arm++) {
+        const f32 steer_input = (arm == 0) ? +1.0f : -1.0f;  /* +1 == full RIGHT, input.h */
+        Vehicle car;
+        InputState input;
+        Vec3 right_before, forward_after;
+        f32 toward_right;
+        int i;
+
+        vehicle_init(&car, &params, testground_height_query, &ground);
+        car.chassis.position = vec3_make(0.0f, params.suspension[WHEEL_FL].rest_length + 0.05f, 5.0f);
+        /* The car must be POINTED along the way it is moving. vehicle_init
+         * leaves the orientation identity, i.e. body +X (forward) along world
+         * +X, so handing it a velocity down +Z would launch it sideways at
+         * 12 m/s -- a 90 degree slip angle, both front tyres saturated, and a
+         * car that slides instead of turning. The first draft of this test did
+         * exactly that and measured a dot of 0.003 either way.
+         *
+         * -90 degrees about +Y is the same yaw place_car_at_start uses to face
+         * world +Z, and it has to be +Z here because the flat test ground runs
+         * along +Z and is only 25 m wide in X. */
+        car.chassis.orientation =
+            quat_from_axis_angle(vec3_make(0.0f, 1.0f, 0.0f), -1.5707963f);
+        /* Rolling, not stationary: a parked wheel has no slip angle and so
+         * generates no lateral force to turn with, whatever the steer angle. */
+        car.chassis.linear_velocity = vec3_make(0.0f, 0.0f, 12.0f);
+        input_init(&input);
+
+        for (i = 0; i < settle_steps; i++) vehicle_step(&car, &input, PHYSICS_DT);
+
+        right_before = vec3_rotate_by_quat(vec3_make(0.0f, 0.0f, 1.0f), car.chassis.orientation);
+        input.steer = steer_input;
+        for (i = 0; i < turn_steps; i++) vehicle_step(&car, &input, PHYSICS_DT);
+
+        forward_after = vec3_rotate_by_quat(vec3_make(1.0f, 0.0f, 0.0f), car.chassis.orientation);
+        toward_right = vec3_dot(forward_after, right_before);
+#if DIRT2_INJECT_FAULT == 31
+        toward_right = -toward_right; /* deliberately wrong -- proves both CHECKs can fail */
+#endif
+        if (arm == 0) dot_right = toward_right; else dot_left = toward_right;
+    }
+
+    fprintf(stderr, "  (steer direction: full-right dot=%+.4f, full-left dot=%+.4f)\n",
+            dot_right, dot_left);
+    /* 0.05 rather than 0.0: a threshold of exactly zero would pass on a car
+     * that barely twitches, and the failure being guarded against here was a
+     * full-magnitude inversion (measured at -0.925 before the fix). */
+    CHECK(dot_right > 0.05f,
+          "full RIGHT steering input must rotate the car toward its own right-hand side");
+    CHECK(dot_left < -0.05f,
+          "full LEFT steering input must rotate the car toward its own left-hand side");
+}
+
 /*===================================================================================*/
 
 int run_physics_tests(void) {
@@ -1377,6 +1463,7 @@ int run_physics_tests(void) {
     test_vehicle_sum_of_normal_loads_equals_weight_at_rest();
     test_vehicle_kinetic_energy_does_not_grow_with_zero_input();
     test_vehicle_stable_crossing_washboard_zone();
+    test_vehicle_steers_toward_the_side_the_input_asks_for();
 
     fprintf(stdout, "physics tests: %d checks, %d failures (PHYSICS_HZ=%d, DIRT2_INJECT_FAULT=%d)\n",
             g_checks, g_failures, PHYSICS_HZ, DIRT2_INJECT_FAULT);

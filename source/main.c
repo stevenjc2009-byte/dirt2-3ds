@@ -30,6 +30,7 @@
 #include "render/renderer.h"
 #include "render/camera.h"
 #include "render/debugdraw.h"
+#include "render/hud.h"
 #include "world/testground.h"
 
 #ifdef __3DS__
@@ -203,6 +204,29 @@ static const TyreSurfaceParams *main_surface_query(void *userdata,
  * it depends on this project's own handedness:
  *     yaw=+90 -> forward=(0, 0, -1)
  *     yaw=-90 -> forward=(0, 0, +1)   <- this one                          */
+/* Extracted from main() for the same reason place_car_at_start was: a host
+ * probe that hand-copies these numbers passes happily while main.c drifts.
+ * The probe for the inverted-steering fix drives through input_update_raw,
+ * so it needs the SHIPPED dead zone and response curve, not a lookalike. */
+static void make_placeholder_input_config(InputConfig *config) {
+    config->circlepad_deadzone = 0.15f;
+    config->circlepad_radius = 156.0f;
+    config->throttle_ramp_rate = 2.0f;
+    config->throttle_release_rate = 3.0f;
+    config->brake_ramp_rate = 4.0f;
+    config->brake_release_rate = 3.0f;
+    /* These two were the landmine. input.c raises the stick fraction to
+     * steer_response_exponent, and fraction^0 == 1.0 -- so leaving this field
+     * unset gave INSTANT FULL STEERING LOCK from the smallest deflection.
+     * input.c now clamps a garbage value to a sane default, but setting it
+     * here explicitly is what makes the intent visible: 1.6 gives fine
+     * control near centre and full lock at the rim, which is what a Circle
+     * Pad needs. steer_return_rate rate-limits the return to centre on
+     * release (steering IN, and countersteer, stay instant). */
+    config->steer_response_exponent = 1.6f;
+    config->steer_return_rate = 8.0f;
+}
+
 static void place_car_at_start(Vehicle *car) {
     car->chassis.position = vec3_make(0.0f, 1.0f, 5.0f);
     car->chassis.orientation =
@@ -236,22 +260,7 @@ int main(int argc, char *argv[]) {
     car.surface_query = main_surface_query;
     place_car_at_start(&car);
 
-    input_config.circlepad_deadzone = 0.15f;
-    input_config.circlepad_radius = 156.0f;
-    input_config.throttle_ramp_rate = 2.0f;
-    input_config.throttle_release_rate = 3.0f;
-    input_config.brake_ramp_rate = 4.0f;
-    input_config.brake_release_rate = 3.0f;
-    /* These two were the landmine. input.c raises the stick fraction to
-     * steer_response_exponent, and fraction^0 == 1.0 -- so leaving this field
-     * unset gave INSTANT FULL STEERING LOCK from the smallest deflection.
-     * input.c now clamps a garbage value to a sane default, but setting it
-     * here explicitly is what makes the intent visible: 1.6 gives fine
-     * control near centre and full lock at the rim, which is what a Circle
-     * Pad needs. steer_return_rate rate-limits the return to centre on
-     * release (steering IN, and countersteer, stay instant). */
-    input_config.steer_response_exponent = 1.6f;
-    input_config.steer_return_rate = 8.0f;
+    make_placeholder_input_config(&input_config);
     input_init(&input);
 
     camera_config.follow_distance = 6.0f;
@@ -284,6 +293,10 @@ int main(int argc, char *argv[]) {
 #endif
     renderer_init();
     debugdraw_init();
+    /* After renderer_init on purpose -- hud.c creates a render target and a
+     * citro2d text buffer, and renderer_init is what calls C3D_Init/C2D_Init.
+     * See hud.h. */
+    hud_init();
 
 #ifdef __3DS__
     /* Wall-clock frame delta source: svcGetSystemTick() is the ARM11 cycle
@@ -307,11 +320,21 @@ int main(int argc, char *argv[]) {
     Vec3 prev_pos = car.chassis.position;
     Quat prev_orient = car.chassis.orientation;
 
+    /* Smoothed frame rate for the bottom-screen readout. The raw 1/frame_dt is
+     * unreadable -- it flickers several fps every frame because the tick delta
+     * quantises against VBlank -- so it is exponentially smoothed here rather
+     * than in hud.c, which deliberately holds no state between frames (hud.h).
+     * 0.05 per frame is roughly a third of a second to settle: slow enough to
+     * read, fast enough that a real drop below 60 shows up while it is
+     * happening rather than after it has passed. */
+    f32 fps_smoothed = 60.0f;
+
     while (running) {
         f32 frame_dt, alpha;
         Vec3 draw_pos;
         Quat draw_orient;
         uint32_t steps, i;
+        HudStats hud_stats;
 
 #ifdef __3DS__
         hidScanInput();
@@ -435,9 +458,54 @@ int main(int argc, char *argv[]) {
                        (double)vec3_length(car.chassis.linear_velocity));
 
         debugdraw_frame_end();
+
+        /* Bottom screen LAST. hud_draw switches the active render target to
+         * the bottom screen and leaves it there (hud.h), so anything drawn to
+         * the top screen after this point would silently land down here. It
+         * also relies on debugdraw_frame_end having already called
+         * C2D_Prepare -- see the comment in hud_draw.
+         *
+         * The numbers come from the same variables the frame just used, not
+         * from a second read of the car: a HUD that samples the simulation
+         * separately from the renderer eventually disagrees with what is on
+         * the top screen, and then the readout is worse than none. */
+        if (frame_dt > 0.0f) {
+            f32 fps_instant = 1.0f / frame_dt;
+            fps_smoothed += (fps_instant - fps_smoothed) * 0.05f;
+        }
+
+        hud_stats.speed_ms = vec3_length(car.chassis.linear_velocity);
+        hud_stats.engine_rpm = car.drivetrain_state.engine_rpm;
+        hud_stats.max_rpm = params.drivetrain.max_rpm;
+        hud_stats.idle_rpm = params.drivetrain.idle_rpm;
+        /* The RAMPED values off InputState, which is what vehicle_step was
+         * actually handed -- not the raw button state. A throttle bar that
+         * snaps to full the instant R is held would be lying about what the
+         * physics received (input.h ramps it over throttle_ramp_rate). */
+        hud_stats.throttle = input.throttle;
+        hud_stats.brake = input.brake;
+        hud_stats.steer = input.steer;
+        hud_stats.handbrake = input.handbrake;
+        hud_stats.position = draw_pos;
+        hud_stats.frame_ms = frame_dt * 1000.0f;
+        hud_stats.fps = fps_smoothed;
+        hud_stats.physics_steps = steps;
+        for (i = 0; i < VEHICLE_WHEEL_COUNT; i++) {
+            const SuspensionState *ws = &car.wheels[i].suspension;
+            hud_stats.wheels[i].compression = ws->compression;
+            hud_stats.wheels[i].max_travel = params.suspension[i].max_travel;
+            hud_stats.wheels[i].normal_load = ws->normal_load;
+            hud_stats.wheels[i].grounded = ws->grounded;
+        }
+        hud_draw(&hud_stats);
+
         renderer_frame_end();
     }
 
+    /* Reverse of init order: hud before renderer, because hud_shutdown deletes
+     * a citro2d text buffer and a citro3d render target, and renderer_shutdown
+     * is what calls C2D_Fini/C3D_Fini. */
+    hud_shutdown();
     debugdraw_shutdown();
     renderer_shutdown();
 #ifdef __3DS__

@@ -148,9 +148,21 @@ static bool vehicle_wheel_is_driven(DriveLayout layout, WheelIndex wheel) {
  *---------------------------------------------------------------------------------*/
 static void vehicle_phase_steering(const VehicleParams *params, Wheel wheels[],
                                     const InputState *input) {
+    /* NOTE THE MINUS. InputState.steer is +1 for full RIGHT (input.h), while
+     * Wheel.steer_angle is a rotation about the chassis up axis by the
+     * right-hand rule -- and in this project's basis (x forward, y up,
+     * z right) a POSITIVE rotation about +Y swings forward toward -Z, which
+     * is the car's LEFT. Same handedness fact that makes place_car_at_start
+     * use a -90 degree yaw to face world +Z.
+     *
+     * Without the minus the car steers exactly backwards, which is what
+     * shipped in v1.0.0 and what steve hit on hardware: "whenever I move the
+     * circle pad left, I turn right; whenever I move the circle pad right, I
+     * turn left." Measured, not reasoned: at 12.4 m/s with full right lock,
+     * dot(forward_after_2s, right_before) was -0.925 -- a hard left. */
     f32 steer = vehicle_clampf(input->steer, -1.0f, 1.0f);
-    wheels[WHEEL_FL].steer_angle = steer * params->max_steer_angle;
-    wheels[WHEEL_FR].steer_angle = steer * params->max_steer_angle;
+    wheels[WHEEL_FL].steer_angle = -steer * params->max_steer_angle;
+    wheels[WHEEL_FR].steer_angle = -steer * params->max_steer_angle;
     wheels[WHEEL_RL].steer_angle = 0.0f;
     wheels[WHEEL_RR].steer_angle = 0.0f;
 }

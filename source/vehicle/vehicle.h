@@ -154,7 +154,16 @@ typedef struct Wheel {
                                      * bug (b) above)                        */
     f32 steer_angle;               /* radians, current steering angle for
                                      * this wheel (0 for rear wheels in
-                                     * Phase 1's front-steer-only setup)     */
+                                     * Phase 1's front-steer-only setup).
+                                     * SIGN: a rotation about the chassis up
+                                     * axis by the right-hand rule, so in this
+                                     * project's basis (x fwd, y up, z right)
+                                     * POSITIVE steers the car LEFT. That is
+                                     * the opposite of InputState.steer, whose
+                                     * +1 is full RIGHT -- vehicle.c's
+                                     * vehicle_phase_steering negates when it
+                                     * converts, and getting that wrong ships
+                                     * a car that steers backwards.          */
 } Wheel;
 
 /* One complete vehicle: a chassis rigid body, four wheels, its tuning
