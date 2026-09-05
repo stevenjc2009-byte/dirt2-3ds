@@ -1,0 +1,51 @@
+; ---------------------------------------------------------------------------
+; dirt2.v.pica -- the ONE vertex shader for the whole process.
+;
+; OWNER: render (see renderer.c, which owns the shaderProgram_s built from
+; this file -- built exactly once at startup, never rebuilt per frame or per
+; scene; see renderer.c's header comment for why).
+;
+; The PICA200 has no programmable fragment shader -- every pixel's colour
+; comes from the fixed-function TEV texture-combiner stage (renderer.c and
+; debugdraw.c configure TEV 0 to just output this shader's outclr
+; unmodified). This vertex shader's only job is: transform a vertex into
+; clip space, and pass its per-vertex colour through untouched.
+;
+; ATTRIBUTES (see debugdraw.c's DebugVertex struct and its AttrInfo setup):
+;   v0 = position, 4 components (x, y, z, 1.0 -- w always supplied as 1.0 by
+;        the CPU side, never assumed by this shader)
+;   v1 = colour,   4 components (r, g, b, a, already 0..1 floats)
+; Both attributes are 4-component on purpose: a 3-component attribute placed
+; before a 4-component one freezes real PICA200 hardware, and keeping every
+; attribute the same width sidesteps the ordering question entirely rather
+; than relying on getting the order right (see docs/CODEMAP.md's hardware
+; notes and this project's Makefile).
+; ---------------------------------------------------------------------------
+
+.alias  inpos v0
+.alias  inclr v1
+
+.fvec   projection[4]
+.fvec   modelView[4]
+
+.out    outpos position
+.out    outclr color
+
+.entry  vmain
+.proc   vmain
+    ; view-space = modelView * inpos
+    dp4 r0.x, modelView[0], inpos
+    dp4 r0.y, modelView[1], inpos
+    dp4 r0.z, modelView[2], inpos
+    dp4 r0.w, modelView[3], inpos
+
+    ; clip-space = projection * view-space
+    dp4 outpos.x, projection[0], r0
+    dp4 outpos.y, projection[1], r0
+    dp4 outpos.z, projection[2], r0
+    dp4 outpos.w, projection[3], r0
+
+    mov outclr, inclr
+
+    end
+.end

@@ -1,0 +1,97 @@
+#---------------------------------------------------------------------------------
+# Makefile.host -- host build of the physics core, zero 3DS dependencies.
+#
+# Builds core/*.c, vehicle/*.c, world/testground.c, source/input/input.c, and
+# tests/*.c. Deliberately does NOT build source/main.c or any
+# source/render/*.c -- those need libctru/citro3d, not available on the host.
+#
+# source/input/input.c IS built here even though it is conceptually "the
+# 3DS input module": tests/test_physics.c calls input_init(), and
+# input.c's actual hardware read (hidCircleRead/hidKeysHeld) is guarded by
+# #ifdef __3DS__ in input_update, so on the host it compiles to a body that
+# touches no libctru symbol at all -- see that file. That guard is what
+# keeps this a zero-3DS-dependency build despite linking input.o.
+#
+# MACHINE NOTE (see this project's other Makefile and the vault): this
+# repo's console build runs ONLY inside the devkitPro MSYS2 shell. This host
+# build is the other half of that split -- it runs under WSL with the
+# system gcc, NOT under devkitARM's cross compiler and NOT under Git Bash's
+# MinGW gcc (a different libc/ABI than WSL's, and mixing the two across
+# sessions has bitten this machine before). Invoke it as:
+#
+#   wsl.exe -d Ubuntu -- bash -lc 'cd "$(wslpath "<windows path to>/dirt2")" && make -f Makefile.host clean test'
+#
+# or from a normal WSL prompt:
+#
+#   cd /mnt/c/Users/steve/Documents/3ds-project-folder/dirt2
+#   make -f Makefile.host clean test
+#---------------------------------------------------------------------------------
+
+CC      := gcc
+BUILD   := build-host
+TARGET  := $(BUILD)/dirt2_tests
+
+# PHYSICS_HZ is a compile-time override (see source/core/timestep.h) --
+# default 120 Hz, the shipping rate. The test harness must also be able to
+# run at 1/60 and 1/100, which the `test-rates` target below does by
+# re-invoking this Makefile three times with PHYSICS_HZ set each time.
+PHYSICS_HZ ?= 120
+
+# -std=gnu11: matches the console build's implicit dialect closely enough
+# for this project's C (no gnu++11-only syntax anywhere in core/vehicle/
+# world) without depending on whatever the host gcc's own default happens
+# to default to across machines/versions.
+# -Wall -Wextra -Werror: same standard this project holds the console build
+# to -- see Makefile's comment. A warning host-side is exactly as much a
+# defect as one console-side; the host build exists partly to catch these
+# cheaply, before a 3DS compile.
+CFLAGS  := -std=gnu11 -Wall -Wextra -Werror -O2 -g -Isource -DPHYSICS_HZ=$(PHYSICS_HZ)
+LDFLAGS := -lm
+
+SRCS := \
+	source/core/vecmath.c \
+	source/core/rigidbody.c \
+	source/core/timestep.c \
+	source/vehicle/suspension.c \
+	source/vehicle/tyre.c \
+	source/vehicle/tyre_lut.c \
+	source/vehicle/drivetrain.c \
+	source/vehicle/vehicle.c \
+	source/world/testground.c \
+	source/input/input.c \
+	tests/test_physics.c \
+	tests/test_main.c
+
+OBJS := $(patsubst %.c,$(BUILD)/%.o,$(SRCS))
+
+.PHONY: all test test-rates clean
+
+all: $(TARGET)
+
+# Builds and RUNS the suite, failing the make invocation if the binary exits
+# non-zero -- see tests/test_main.c for what "non-zero" means (at least one
+# CHECK in tests/test_physics.c failed). A build that merely links is not
+# proof the physics core works; running it is the actual check.
+test: $(TARGET)
+	./$(TARGET)
+
+# Runs the exact same test binary at all three rates this project commits to
+# supporting (see core/timestep.h) by re-invoking this Makefile per rate
+# into separate build directories, so a stale 120 Hz object never gets
+# linked into the 60 Hz run or vice versa. Stops at the first failing rate
+# rather than running all three and hiding which one broke.
+test-rates:
+	@for hz in 60 100 120; do \
+		echo "=== PHYSICS_HZ=$$hz ==="; \
+		$(MAKE) -f Makefile.host BUILD=build-host-$$hz PHYSICS_HZ=$$hz test || exit 1; \
+	done
+
+$(TARGET): $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
+
+$(BUILD)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+clean:
+	rm -rf build-host build-host-60 build-host-100 build-host-120
