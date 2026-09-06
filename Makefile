@@ -40,7 +40,11 @@ INCLUDES	:=	source
 ROMFS		:=	romfs
 
 APP_TITLE	:=	DiRT2 Clone
-APP_DESCRIPTION	:=	From-scratch rally driving, Phase 1 physics test
+# This is the SMDH long description -- the line the Home Menu shows under the
+# title, so it is user-facing on every install. It said "Phase 1 physics test"
+# right up to v1.0.2, which was a build with a circuit, a lap clock and an
+# update check in it. Keep it describing what the build actually IS.
+APP_DESCRIPTION	:=	Rally driving on a closed circuit, against the clock
 APP_AUTHOR	:=	steve
 
 #---------------------------------------------------------------------------------

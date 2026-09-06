@@ -151,9 +151,16 @@ Measured, not asserted:
   arm of the same sweep (world shrunk to half-width 30 m) reported 152 of
   4284 missing, so the sweep can fail.
 - **Link chain**, from the symbol table on `dirt2.elf` (`arm-none-eabi-nm`):
-  563 `curl_` symbols, 561 `mbedtls_` symbols, and `socInit`, `update_check`,
-  `qr_encode_url` and `pausemenu_update` all present as defined text
-  symbols. No unresolved symbols other than the usual weak ones.
+  563 libcurl symbols — 47 public `curl_` plus 516 internal `Curl_`, which
+  is worth writing out because grepping only the lowercase prefix finds 47
+  and looks like a half-linked library — 561 `mbedtls_` symbols of which 30
+  are defined `mbedtls_x509`, and `socInit`, `update_check`, `qr_encode_url`
+  and `pausemenu_update` all present as defined text symbols. Zero
+  undefined symbols.
+
+  This check exists because a clean link proved nothing. Before `main.c`
+  called into any of it, `--gc-sections` (which arrives via `3dsx.specs`)
+  had stripped every one of those symbols and `make` still returned 0.
 - **The CIA artifact** contains the CA bundle: 121
   `-----BEGIN CERTIFICATE-----` and 121 `-----END CERTIFICATE-----`
   occurrences in `dirt2.cia`, and the RomFS filename `cacert.pem`.
@@ -200,4 +207,22 @@ Not verified:
 
 ## Licence
 
-None specified.
+This project's own code carries no licence. That is unchanged, and choosing
+one is the project owner's call to make, not something decided here.
+
+Two third-party components are vendored into the repository and do carry
+licences of their own:
+
+- `source/ui/qrcodegen.c` and `source/ui/qrcodegen.h` are Project Nayuki's
+  **qrcodegen** library, MIT licensed. The MIT header is retained verbatim
+  at the top of both files, copyright "Project Nayuki" — that header is
+  the licence text.
+- `romfs/cacert.pem` is a bundle of CA root certificates. Its own header
+  says it is certificate data from Mozilla, extracted via curl's
+  `mk-ca-bundle.pl` — but the file carries no licence statement of its
+  own, so its licensing terms are not established anywhere in this
+  repository.
+
+Both ship inside the built `.cia`, so redistributing the `.cia`
+redistributes them: qrcodegen's MIT terms travel with it, and
+`cacert.pem`'s licensing remains unresolved.
