@@ -158,12 +158,19 @@ Measured, not asserted:
   `-----BEGIN CERTIFICATE-----` and 121 `-----END CERTIFICATE-----`
   occurrences in `dirt2.cia`, and the RomFS filename `cacert.pem`.
   `dirt2.cia` is 951,232 bytes; `dirt2.3dsx` is 1,240,832 bytes.
-- **In the Azahar 2126.0 emulator, booting the CIA** rather than the 3dsx:
-  the pause menu opens on SELECT and shows Resume / Options / Quit; Options
-  → Update completes and reports current 1.0.2, latest 1.0.0, "up to
-  date", and draws a QR code for the release on the bottom screen; B backs
-  out; SELECT resumes and the car drives again at 60 FPS. The simulation is
+- **In the Azahar 2126.0 emulator, booting the installed title** — the
+  `.app` under `sdmc`, which is what a console holds after an FBI install,
+  rather than the `.3dsx` — the pause menu opens on SELECT and shows
+  Resume / Options / Quit; **Options → Update** completes against the live
+  GitHub release and reports current 1.0.2, latest 1.0.2, "up to date",
+  with a QR code for that release on the bottom screen; B backs out; SELECT
+  resumes and the car drives again at 60 FPS, 1.08 ms. The simulation is
   frozen while the menu is open (steps 0, alpha 0.00).
+
+  Run before v1.0.2 was published, the same check reported latest **1.0.0**
+  — so this is a check that can come out either way rather than one that
+  cannot fail. The installed title carries the CA bundle in its own right:
+  121 `-----BEGIN CERTIFICATE-----` occurrences in the installed `.app`.
 - **The invisible wall, driven in the emulator** rather than only
   unit-tested: with throttle held at full (6209 rpm) and the steering on
   full lock for 25 seconds, the car came to rest pinned at 8 m off the
