@@ -97,7 +97,32 @@ RACE_SRCS := \
 
 RACE_OBJS := $(patsubst %.c,$(RACE_BUILD)/%.o,$(RACE_SRCS))
 
-.PHONY: all test test-rates race-test test-all clean
+#---------------------------------------------------------------------------------
+# Barrier suite (tests/test_barrier.c against source/race/barrier.c) -- a
+# THIRD separate target/binary/object dir, for the same reason the race
+# suite is separate: test_barrier.c defines its own main().
+#
+# It shares the DIRT2_INJECT_FAULT mechanism but uses fault numbers 10-13,
+# deliberately clear of track.c's 5 and lap.c's 1/2/3/4/6, so an arm aimed
+# at the barrier cannot silently be caught by a lap fault or vice versa.
+# Own build dir keeps fault-poisoned objects out of the other two suites.
+#---------------------------------------------------------------------------------
+BARRIER_BUILD := build-host-barrier
+BARRIER_TARGET := $(BARRIER_BUILD)/dirt2_barrier_tests
+
+BARRIER_CFLAGS := $(CFLAGS) -DDIRT2_INJECT_FAULT=$(DIRT2_INJECT_FAULT)
+
+BARRIER_SRCS := \
+	source/core/vecmath.c \
+	source/core/rigidbody.c \
+	source/core/timestep.c \
+	source/race/track.c \
+	source/race/barrier.c \
+	tests/test_barrier.c
+
+BARRIER_OBJS := $(patsubst %.c,$(BARRIER_BUILD)/%.o,$(BARRIER_SRCS))
+
+.PHONY: all test test-rates race-test barrier-test test-all clean
 
 all: $(TARGET)
 
@@ -125,8 +150,12 @@ test-rates:
 race-test: $(RACE_TARGET)
 	./$(RACE_TARGET)
 
-# Combined "run everything" target -- both suites, physics first.
-test-all: test race-test
+# Builds and RUNS the barrier suite (tests/test_barrier.c), same discipline.
+barrier-test: $(BARRIER_TARGET)
+	./$(BARRIER_TARGET)
+
+# Combined "run everything" target -- all three suites, physics first.
+test-all: test race-test barrier-test
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $@ $(OBJS) $(LDFLAGS)
@@ -142,5 +171,13 @@ $(RACE_BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(RACE_CFLAGS) -c -o $@ $<
 
+$(BARRIER_TARGET): $(BARRIER_OBJS)
+	$(CC) $(BARRIER_CFLAGS) -o $@ $(BARRIER_OBJS) $(LDFLAGS)
+
+$(BARRIER_BUILD)/%.o: %.c
+	@mkdir -p $(dir $@)
+	$(CC) $(BARRIER_CFLAGS) -c -o $@ $<
+
 clean:
-	rm -rf build-host build-host-60 build-host-100 build-host-120 build-host-race
+	rm -rf build-host build-host-60 build-host-100 build-host-120 build-host-race \
+	       build-host-barrier

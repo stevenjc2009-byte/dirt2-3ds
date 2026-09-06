@@ -33,7 +33,11 @@
 #include "render/hud.h"
 #include "race/track.h"
 #include "race/lap.h"
+#include "race/barrier.h"
+#include "ui/pausemenu.h"
 #include "world/testground.h"
+
+#include <math.h>   /* atan2f, for deriving the start yaw from the track */
 
 #ifdef __3DS__
 #include <3ds.h>
@@ -120,13 +124,22 @@ static void make_placeholder_vehicle_params(VehicleParams *params) {
 }
 
 static void make_placeholder_testground_config(TestgroundConfig *config) {
-    config->world_half_width = 25.0f;
+    /* GROWN for v1.0.2 to hold the enlarged oval, and it is a matched pair
+     * with it: race/track.c's track_build_example_oval now reaches X = +-29,
+     * and race/barrier.c's wall sits a further 4 m out beyond the gravel
+     * run-off, so the drivable world reaches X = +-33 and Z = 5..167. A 25 m
+     * half-width world would have both the ribbon and the wall running off the
+     * sides. See track_build_example_oval's comment for the full margin
+     * arithmetic. This does not fail loudly if the two drift apart -- the
+     * track just leaves the world and testground_height_query starts returning
+     * false under a car that is still visually on the road. */
+    config->world_half_width = 38.0f;
     config->base_height = 0.0f;
-    config->flat_length = 40.0f;
-    config->hills_length = 60.0f;
+    config->flat_length = 45.0f;
+    config->hills_length = 70.0f;
     config->hills_amplitude = 0.6f;
     config->hills_wavelength = 20.0f;
-    config->washboard_length = 40.0f;
+    config->washboard_length = 60.0f;
     config->washboard_amplitude = 0.05f;
     config->washboard_wavelength = 1.2f;
 
@@ -173,14 +186,85 @@ static void make_placeholder_testground_config(TestgroundConfig *config) {
     }
 }
 
-/* Adapter: vehicle.h's VehicleSurfaceQuery -> world/testground.h's lookup.
- * This thin function is the ONLY thing coupling the vehicle to the world;
- * vehicle/ deliberately does not include world/ (see vehicle.h). Without it
- * being installed on the Vehicle below, testground_surface_at is never called
- * by anything and tarmac and gravel feel identical. */
+/* Everything the surface lookup below needs, in one struct, because
+ * vehicle.h's VehicleSurfaceQuery passes exactly one void* and the answer now
+ * depends on BOTH the world and the circuit. */
+typedef struct SurfaceContext {
+    /* Non-const because suspension.h's SuspensionGroundQuery takes a plain
+     * void*, and casting the const away at every call is a worse smell than
+     * simply not claiming a constness the callback signature cannot carry.
+     * Nothing here writes through it. */
+    Testground *ground;
+    const Track *track;
+
+    /* track_query's search hint. Deliberately its OWN cache and not shared
+     * with lap_update's or the HUD's: each caller queries at a different
+     * cadence and from a different position, and two callers sharing one hint
+     * hand each other the wrong starting guess. It is only a hint --
+     * track_query falls back to a full scan -- so sharing would be slower and
+     * confusing rather than wrong, which is exactly the kind of bug that never
+     * gets found. */
+    int cached_segment;
+
+    /* Copies, not pointers into the TestgroundConfig, which is a caller stack
+     * local that does not outlive main()'s setup block. */
+    TyreSurfaceParams on_track;
+    TyreSurfaceParams off_track;
+} SurfaceContext;
+
+/* Adapter: suspension.h's SuspensionGroundQuery -> the testground inside the
+ * context. This indirection exists for one reason: vehicle.h gives the ground
+ * query and the surface query a SINGLE shared userdata pointer ("both queries
+ * answer about the same world"), and as of v1.0.2 the surface answer needs the
+ * Track as well as the heightfield. So the shared pointer became the
+ * SurfaceContext, and the height query unwraps it.
+ *
+ * The alternative was to add a second userdata field to Vehicle. Rejected:
+ * vehicle.h's one-world-one-pointer contract is correct, and it is still true
+ * here -- SurfaceContext simply IS this project's description of that one
+ * world. Widening a shared header to avoid writing a four-line adapter in the
+ * one file that owns the coupling is the wrong trade. */
+static bool main_height_query(void *userdata, f32 world_x, f32 world_z,
+                               f32 *out_height, Vec3 *out_normal) {
+    SurfaceContext *ctx = (SurfaceContext *)userdata;
+    return testground_height_query(ctx->ground, world_x, world_z,
+                                    out_height, out_normal);
+}
+
+/* Adapter: vehicle.h's VehicleSurfaceQuery -> what the tyre is actually
+ * standing on. This thin function is the ONLY thing coupling the vehicle to
+ * the world; vehicle/ deliberately does not include world/ (see vehicle.h).
+ * Without it being installed on the Vehicle below, the whole surface system is
+ * dead code that still compiles and still passes its own tests.
+ *
+ * v1.0.2: THE RIBBON IS NOW ITS OWN SURFACE. Before this, grip came only from
+ * testground.c's three height zones, which meant the racing line and the dirt
+ * beside it had identical grip and cutting a corner was free -- there was no
+ * such thing as "off the track", only "off the world". Now the circuit decides:
+ * inside the ribbon is tarmac, everything else is gravel.
+ *
+ * That deliberately OVERRIDES testground's own per-zone surfaces rather than
+ * blending with them. The zones exist to make suspension behaviour testable
+ * (flat / hills / washboard), and they were never a statement about where the
+ * road is. Keeping them would have left the flat zone with tarmac grip on both
+ * sides of the white line, so a third of the lap would still have had no
+ * penalty for cutting -- a rule that applies in two thirds of the cases is
+ * worse than none, because it teaches the driver the wrong thing.
+ *
+ * Cost: four calls per physics step, 480/s. track_query is a windowed search
+ * around the cached hint, and all four wheels are within two metres of each
+ * other, so the hint is warm on every call after the first. */
 static const TyreSurfaceParams *main_surface_query(void *userdata,
                                                     f32 world_x, f32 world_z) {
-    return testground_surface_at((const Testground *)userdata, world_x, world_z);
+    SurfaceContext *ctx = (SurfaceContext *)userdata;
+    TrackQueryResult q;
+    f32 offset;
+
+    track_query(ctx->track, vec3_make(world_x, 0.0f, world_z),
+                &ctx->cached_segment, &q);
+
+    offset = q.lateral_offset < 0.0f ? -q.lateral_offset : q.lateral_offset;
+    return (offset <= q.half_width) ? &ctx->on_track : &ctx->off_track;
 }
 
 /* Where the car starts, and which way it points. A separate function rather
@@ -229,27 +313,45 @@ static void make_placeholder_input_config(InputConfig *config) {
     config->steer_return_rate = 8.0f;
 }
 
-static void place_car_at_start(Vehicle *car) {
-    /* ON THE GRID, not next to it. v0.2 gave the world a closed circuit
-     * (race/track.c's track_build_example_oval) and the car has to start on
-     * waypoint 0 of it or no lap can ever be counted -- lap.c only counts a
+static void place_car_at_start(Vehicle *car, const Track *track) {
+    /* ON THE GRID, not next to it, and DERIVED FROM THE TRACK rather than
+     * typed out. v0.2 gave the world a closed circuit and the car has to start
+     * on waypoint 0 of it or no lap can ever be counted -- lap.c only counts a
      * forward wrap-crossing of the start line, and a car parked outside the
      * loop never crosses anything.
      *
-     * (-12, 22) is waypoint 0 exactly: the south end of the left-hand
-     * straight. Was (0, 5), which is off the track entirely -- the bottom
-     * hairpin's nearest point is z = 6. The Y of 1.0 is unchanged and is
-     * deliberately above the ground so the suspension settles the car down
-     * onto the surface in the first few steps rather than starting
-     * interpenetrating it.
+     * This USED to be the literal `(-12, 1, 22)`, which was waypoint 0 of the
+     * old oval. That is precisely the bug this version exists to stop
+     * repeating: v1.0.2 enlarged the circuit, waypoint 0 moved to
+     * (-24, 38), and a hardcoded start pose would have put the car 12 m off
+     * the road facing nothing in particular, with no error and no warning --
+     * just a lap counter that never moved. The pose now cannot drift from the
+     * track because it is read out of the track.
      *
-     * The yaw is UNCHANGED and must stay: -90 degrees about +Y faces world
-     * +Z, which is the direction waypoint 0 -> waypoint 1 runs. Facing the
-     * other way would make every lap a reverse crossing, which lap.c
-     * correctly refuses to count. */
-    car->chassis.position = vec3_make(-12.0f, 1.0f, 22.0f);
+     * THE YAW IS COMPUTED, NOT ASSUMED. Body forward is +X (vehicle.c:115),
+     * and a rotation of theta about +Y maps it to (cos theta, 0, -sin theta):
+     *     theta =   0 -> forward = (+1, 0,  0)
+     *     theta = +90 -> forward = ( 0, 0, -1)
+     *     theta = -90 -> forward = ( 0, 0, +1)
+     * So to face along a tangent (tx, tz) we need cos theta = tx and
+     * sin theta = -tz, i.e. theta = atan2(-tz, tx). For this oval waypoint 0
+     * -> 1 runs due +Z, giving atan2(-1, 0) = -90 degrees -- the same value
+     * that was hardcoded before, which is the arithmetic agreeing with the
+     * measurement rather than replacing it. Facing the other way would make
+     * every lap a reverse crossing, which lap.c correctly refuses to count.
+     *
+     * Y = 1.0 is deliberately above the settled ride height (0.466 m) so the
+     * car drops onto its springs at boot rather than starting interpenetrating
+     * the ground: a free, obvious check that gravity and the suspension are
+     * both alive. */
+    Vec3 start = track->waypoints[0].center;
+    Vec3 next = track->waypoints[1 % track->count].center;
+    f32 tx = next.x - start.x;
+    f32 tz = next.z - start.z;
+
+    car->chassis.position = vec3_make(start.x, 1.0f, start.z);
     car->chassis.orientation =
-        quat_from_axis_angle(vec3_make(0.0f, 1.0f, 0.0f), -1.5707963f);
+        quat_from_axis_angle(vec3_make(0.0f, 1.0f, 0.0f), atan2f(-tz, tx));
 }
 
 int main(int argc, char *argv[]) {
@@ -267,17 +369,62 @@ int main(int argc, char *argv[]) {
     Vec3 wheel_offsets[VEHICLE_WHEEL_COUNT];
     bool running = true;
 
+    /* SELECT opens this. While it is open the simulation is frozen and the
+     * bottom screen belongs to the menu instead of the HUD -- see the wiring
+     * in the frame loop below and the call-order note in ui/pausemenu.h. */
+    PauseMenu pause_menu;
+
+    /* The circuit and the lap timer. Both live here for the whole run: the
+     * Track is immutable once built, and LapState borrows a pointer to it
+     * (lap.h says borrowed, not owned) so the Track must outlive it -- same
+     * scope, declared in that order, is the simplest way to guarantee that.
+     *
+     * hud_query_segment and barrier_segment are track_query search caches,
+     * each private to one caller: the HUD queries once per FRAME, the barrier
+     * once per physics STEP, and lap_update and SurfaceContext keep their own
+     * on top of that. Four callers, four caches, for the reason given on
+     * SurfaceContext.cached_segment -- a shared cache would be thrashed
+     * between callers sampling at different cadences and different positions,
+     * turning track_query's O(1) hint into a full O(n) rescan every time. */
+    Track track;
+    LapState lap_state;
+    SurfaceContext surface_ctx;
+    int hud_query_segment = TRACK_UNKNOWN_SEGMENT;
+    int barrier_segment = TRACK_UNKNOWN_SEGMENT;
+
     make_placeholder_testground_config(&ground_config);
     testground_generate(&testground, &ground_config);
 
+    /* THE TRACK IS BUILT FIRST, before the car exists. Two things now read
+     * their setup out of it -- where the car starts, and which surface each
+     * tyre is on -- so building it later would mean deriving both from an
+     * uninitialised Track. It used to be built just above the frame loop,
+     * which was fine when nothing depended on it. */
+    track_build_example_oval(&track);
+    lap_init(&lap_state, &track);
+
+    /* Filled BEFORE vehicle_init, because it is the userdata both of the
+     * vehicle's world callbacks are about to be handed. The two surfaces come
+     * from the ground config rather than being invented here, so the numbers
+     * the tyre model sees stay tied to the ones the project's shipped tyre
+     * table defines. */
+    surface_ctx.ground = &testground;
+    surface_ctx.track = &track;
+    surface_ctx.cached_segment = TRACK_UNKNOWN_SEGMENT;
+    surface_ctx.on_track = ground_config.surface_tarmac;
+    surface_ctx.off_track = ground_config.surface_gravel;
+
     make_placeholder_vehicle_params(&params);
-    vehicle_init(&car, &params, testground_height_query, &testground);
-    /* vehicle_init leaves this NULL on purpose (vehicle.h). Setting it is
-     * what makes the ground's tarmac/gravel zones actually reach the tyre
+    vehicle_init(&car, &params, main_height_query, &surface_ctx);
+
+    /* vehicle_init leaves surface_query NULL on purpose (vehicle.h). Setting
+     * it is what makes the tarmac/gravel distinction actually reach the tyre
      * model -- leave it out and the whole surface system is dead code that
-     * still compiles and still passes its own tests. */
+     * still compiles and still passes its own tests. It reuses
+     * ground_userdata, which is why that had to be the SurfaceContext. */
     car.surface_query = main_surface_query;
-    place_car_at_start(&car);
+
+    place_car_at_start(&car, &track);
 
     make_placeholder_input_config(&input_config);
     input_init(&input);
@@ -316,6 +463,11 @@ int main(int argc, char *argv[]) {
      * citro2d text buffer, and renderer_init is what calls C3D_Init/C2D_Init.
      * See hud.h. */
     hud_init();
+    /* Also after renderer_init, and for the same reason: pausemenu.c allocates
+     * its own citro2d text buffers. It draws to hud.c's bottom-screen target
+     * rather than creating a second one, so it must also come after hud_init.
+     * See pausemenu.h's call-order note. */
+    pausemenu_init(&pause_menu);
 
 #ifdef __3DS__
     /* Wall-clock frame delta source: svcGetSystemTick() is the ARM11 cycle
@@ -348,24 +500,10 @@ int main(int argc, char *argv[]) {
      * happening rather than after it has passed. */
     f32 fps_smoothed = 60.0f;
 
-    /* The circuit and the lap timer. Both live here for the whole run: the
-     * Track is immutable once built, and LapState borrows a pointer to it
-     * (lap.h says borrowed, not owned) so the Track must outlive it -- same
-     * scope, declared in that order, is the simplest way to guarantee that.
-     *
-     * hud_query_segment is track_query's search cache for the HUD's own
-     * per-FRAME query. It is deliberately NOT lap_state.cached_segment:
-     * lap_update owns that one and runs once per physics STEP, and two
-     * callers sharing one cache would have each other's last position as
-     * their search hint. The cache is only a hint -- track_query falls back
-     * to a full scan -- so sharing it would not be wrong, just slower and
-     * confusing about who owns what. */
-    Track track;
-    LapState lap_state;
-    int hud_query_segment = TRACK_UNKNOWN_SEGMENT;
-
-    track_build_example_oval(&track);
-    lap_init(&lap_state, &track);
+    /* (The Track, LapState and hud_query_segment used to be declared and built
+     * here. They moved to the top of main() in v1.0.2 because the car's start
+     * pose and the tyre surface lookup are both derived from the track now, and
+     * both are set up well before this point.) */
 
     while (running) {
         f32 frame_dt, alpha;
@@ -377,6 +515,17 @@ int main(int argc, char *argv[]) {
 #ifdef __3DS__
         hidScanInput();
         running = !(hidKeysHeld() & KEY_START);
+
+        /* Exactly once per rendered frame, and BEFORE the physics below --
+         * pausemenu.h's contract. It reads SELECT to open, and the D-pad and
+         * A/B to navigate, straight off hidKeysDown, so it deliberately does
+         * NOT go through input.c: input.c models a driver's controls (ramped
+         * throttle, ramped brake, steer) at physics cadence, and a menu needs
+         * raw one-shot button edges at frame cadence instead. */
+        pausemenu_update(&pause_menu, (uint32_t)hidKeysDown());
+        if (pausemenu_take_quit_request(&pause_menu)) {
+            running = false;
+        }
 
         {
             u64 now_tick = svcGetSystemTick();
@@ -408,7 +557,25 @@ int main(int argc, char *argv[]) {
             frame_dt = 0.0f;
         }
 
-        steps = timestep_advance(&timestep, frame_dt);
+        if (pausemenu_is_open(&pause_menu)) {
+            /* Frozen while the menu is up. The accumulator is RESET rather
+             * than merely left un-advanced, because the update check is a
+             * blocking network call that can sit there for seconds: banking
+             * that wall time would hand timestep_advance a huge debt the
+             * moment the menu closed, and the car would fast-forward across
+             * the track on the first frame after resume.
+             *
+             * The previous pose is dragged up to the current one so the
+             * interpolation below resolves to the car's actual resting pose
+             * instead of the pose one step before the freeze -- otherwise
+             * pausing and resuming each nudge the drawn car by one step. */
+            steps = 0;
+            timestep_init(&timestep);
+            prev_pos = car.chassis.position;
+            prev_orient = car.chassis.orientation;
+        } else {
+            steps = timestep_advance(&timestep, frame_dt);
+        }
         for (i = 0; i < steps; i++) {
             /* Snapshot INSIDE the loop, not before it: on a catch-up frame
              * that runs several steps, the pose to interpolate from is the
@@ -426,6 +593,22 @@ int main(int argc, char *argv[]) {
              * once per step, not once for the whole frame). */
             input_update(&input, &input_config, PHYSICS_DT);
             vehicle_step(&car, &input, PHYSICS_DT);
+
+            /* The invisible wall, applied to the RESULT of the step that just
+             * ran -- barrier.h's contract is explicitly "after vehicle_step",
+             * because it corrects an already-integrated position rather than
+             * contributing a force to the integration.
+             *
+             * It must run BEFORE lap_update, not after: lap_update decides
+             * whether the car crossed the start line from the position it is
+             * handed, and handing it a position the barrier is about to move
+             * would let a crossing be credited at a place the car never
+             * actually occupied.
+             *
+             * Its own segment cache, separate from lap_update's and the HUD's
+             * -- three callers querying the track at three different cadences
+             * must not share one cache (see track.h's caching contract). */
+            barrier_apply(&track, &car.chassis, &barrier_segment);
 
             /* Once per physics STEP, not once per render frame -- lap.h's
              * contract. Lap times are accumulated dt, so calling this once
@@ -528,6 +711,11 @@ int main(int argc, char *argv[]) {
 
         debugdraw_frame_end();
 
+        /* AFTER debugdraw_frame_end, per pausemenu.h: the menu's top-screen
+         * banner is citro2d text, and debugdraw_frame_end is what calls
+         * C2D_Prepare. It draws nothing at all while the menu is closed. */
+        pausemenu_draw_top(&pause_menu);
+
         /* Bottom screen LAST. hud_draw switches the active render target to
          * the bottom screen and leaves it there (hud.h), so anything drawn to
          * the top screen after this point would silently land down here. It
@@ -591,14 +779,28 @@ int main(int argc, char *argv[]) {
             hud_stats.wheels[i].normal_load = ws->normal_load;
             hud_stats.wheels[i].grounded = ws->grounded;
         }
-        hud_draw(&hud_stats);
+        /* EXACTLY ONE of these two runs, never both: they draw to the same
+         * bottom-screen target (pausemenu.c asks hud.c for it via
+         * hud_get_target rather than creating a second one), and each begins
+         * by clearing it, so calling both would leave whichever ran second as
+         * the only thing visible and waste a full clear on the other. */
+        if (pausemenu_is_open(&pause_menu)) {
+            pausemenu_draw_bottom(&pause_menu);
+        } else {
+            hud_draw(&hud_stats);
+        }
 
         renderer_frame_end();
     }
 
     /* Reverse of init order: hud before renderer, because hud_shutdown deletes
      * a citro2d text buffer and a citro3d render target, and renderer_shutdown
-     * is what calls C2D_Fini/C3D_Fini. */
+     * is what calls C2D_Fini/C3D_Fini.
+     *
+     * pausemenu before hud for the same reason one level down: it borrows
+     * hud.c's render target, so it must let go of its own citro2d resources
+     * while that target is still alive. */
+    pausemenu_shutdown(&pause_menu);
     hud_shutdown();
     debugdraw_shutdown();
     renderer_shutdown();

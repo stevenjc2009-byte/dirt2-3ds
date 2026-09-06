@@ -15,11 +15,17 @@
 #                                       0xA5915, Skywave 0xF5AA0, Verdant Pass
 #                                       0xF7B00, Raytracer3DS 0xB2F00).
 #
-# Everything below is byte-for-byte the raytracer3ds spec. RomFs is already
-# absent there and stays absent here -- dirt2 has no romfs/ directory. The
-# permission, syscall and service lists are wider than this app needs, but they
-# are the proven set; trimming them is a way to make a title that installs and
-# then crashes.
+#   * RomFs                            - ADDED for v0.2. raytracer3ds has no
+#                                       RomFs section because it ships no
+#                                       romfs/ directory; dirt2 now ships
+#                                       romfs/cacert.pem, which the in-app
+#                                       updater cannot work without. See the
+#                                       RomFs section near the bottom.
+#
+# Everything else below is byte-for-byte the raytracer3ds spec. The permission,
+# syscall and service lists are wider than this app needs, but they are the
+# proven set; trimming them is a way to make a title that installs and then
+# crashes.
 
 BasicInfo:
   Title                   : "DiRT2 Clone"
@@ -231,7 +237,20 @@ AccessControlInfo:
    - ssl:C
 
 
-# No RomFs section: dirt2 ships no romfs/ directory (see header note).
+RomFs:
+  # ADDED 2026-09-06, and it is not cosmetic: without this section makerom
+  # builds a CIA with no RomFs at all, and the v0.2 in-app updater cannot
+  # work on an installed title. http.c reads romfs:/cacert.pem up front in
+  # http_net_init(); with no RomFs that fopen fails, http_net_init() returns
+  # false, and every update check reports an error on hardware.
+  #
+  # This stayed invisible until the artifact itself was checked, because a
+  # .3dsx embeds its RomFs automatically -- so the emulator run passed the
+  # update check end to end while the CIA built beside it never could have.
+  # The evidence was a byte search of dirt2.cia (EnableCrypt is false above,
+  # so the RomFs partition sits in plain view in the file): 0 occurrences of
+  # "-----BEGIN CERTIFICATE-----" before this change, 121 after.
+  RootPath                : $(APP_ROMFS)
 
 SystemControlInfo:
   SaveDataSize: 0KB # Change if the app uses savedata

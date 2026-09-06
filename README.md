@@ -12,8 +12,16 @@ of app RAM and 6 MB of VRAM in two 3 MB banks.
 
 ## What this release actually is
 
-**A car you can drive, on a test ground.** There is no race, no lap timing, no
-opponents and no track — that is the next milestone. What works today:
+**A car you can drive, on a closed circuit, against a lap clock.** There are no
+opponents and no car model beyond a debug shape — those are the next
+milestones. What works today:
+
+- A **closed oval circuit** with painted edges, a start/finish line, lap
+  counting and lap timing (current, last and best)
+- **Invisible walls** just outside the track, with a 4 m gravel run-off between
+  the racing line and the wall — off the ribbon you lose grip, past the wall
+  you simply stop
+- A **pause menu** on SELECT, with an in-app **update check** (see below)
 
 - A four-wheel vehicle with a real **rigid body** (semi-implicit Euler,
   quaternion orientation renormalised every step)
@@ -38,19 +46,25 @@ opponents and no track — that is the next milestone. What works today:
 | L | Brake |
 | A | Handbrake |
 | Circle Pad | Steer |
+| SELECT | Pause menu |
 | START | Exit |
 
 L and R are digital buttons with no analog travel, so throttle and brake are
 **ramped in software** rather than snapping between 0 and 1 — no module outside
 `input.c` ever sees the raw button state.
 
-### The test ground has no edges
+### You can no longer fall off the world
 
-Outside roughly X ±25 m, or past Z 140 m, the ground query returns "no ground"
-rather than extrapolating, and the car falls forever with no way back. This is
-deliberate and known: the next milestone closes the ground into a looped
-circuit, at which point the boundary stops existing, so building walls or a
-respawn now would be work thrown away. Press START and relaunch.
+v1.0.0 had no edges: outside roughly X ±25 m the ground query returned "no
+ground" and the car fell forever with no way back. This release closes that.
+Three bands, measured from the centre line of the track:
+
+- **0 – 5 m** — the tarmac ribbon, full grip
+- **5 – 9 m** — gravel run-off, reduced grip, and the lap readout turns red
+- **8.4 m** — an invisible wall the car cannot be pushed past
+
+The wall sits *outside* the painted edge on purpose, so the off-track grip
+penalty is somewhere you can actually reach and drive on rather than dead code.
 
 ## Building
 
@@ -73,7 +87,9 @@ dependencies, so it can be tested without an emulator:
 make -f Makefile.host clean test
 ```
 
-`make -f Makefile.host test-rates` runs the same suite again at 60 Hz and
+`make -f Makefile.host test-all` runs three suites: the physics core, the race
+suite (track, lap timing) and the barrier suite (the invisible walls).
+`make -f Makefile.host test-rates` runs the physics suite again at 60 Hz and
 100 Hz in separate build directories — the physics must not change with the
 step rate, and this is what proves it.
 
@@ -94,7 +110,22 @@ so a specific version can be installed rather than whatever is newest:
 
 | Version | Branch | QR |
 | --- | --- | --- |
+| v1.0.2 | `v1.0.2` | `meta/qr-v1.0.2.png` |
 | v1.0.0 | `v1.0.0` | `meta/qr-v1.0.0.png` |
+
+## Checking for updates on the console
+
+Press **SELECT** while driving to pause. **Options → Update** asks GitHub
+whether a newer release exists and shows this build's version and the latest
+published version side by side, with a QR code for that release on the bottom
+screen.
+
+It **checks and reports only** — it does not download or install anything.
+Install with FBI and the QR code, as above.
+
+This talks to GitHub over libcurl + mbedTLS rather than the console's own
+`ssl:C` service, which was measured on real hardware to top out at TLS 1.1
+while GitHub has required TLS 1.2 or better since 2018.
 
 ## Art
 
@@ -107,25 +138,58 @@ no textured model yet.
 
 Measured, not asserted:
 
-- **Physics, host build:** 65 checks, 0 failures, at 60 Hz, 100 Hz and 120 Hz.
-  Wheelbase 2.550 m, track 1.600 m. Settling on flat ground: y = 0.4659 m at
-  both 2 s and 4 s against a predicted 0.466 m, 4/4 wheels grounded. Five
-  seconds of full throttle from rest: 16.09 m/s. Six seconds of braking from
-  there: 0.006 m/s.
-- **The real input path, in an emulator** — `hidScanInput` → `input_update` →
-  `vehicle_step`, driven by held hardware buttons rather than by calling the
-  physics directly: idle 0.0 m/s; 3 s throttle 16.0 m/s with the car centred and
-  framed; adding steer 15.5 m/s with the car visibly yawed; 2 s brake 0.0 m/s at
-  rest. 60 FPS throughout, 0.50–0.90 ms per frame.
+- **Host test suites, from a clean build** (`make -f Makefile.host
+  test-all`): physics 68 checks 0 failures (`PHYSICS_HZ=120`); `test_race`
+  1475 checks 0 failures; `test_barrier` 68 checks 0 failures; overall exit
+  code 0.
+- **Fault injection:** both the race suite and the barrier suite have a red
+  arm; each returns exit 2 with named failures, so the suites can actually
+  go red.
+- **Containment sweep** over the whole reachable area (racing ribbon plus
+  gravel run-off out to the wall): 0 of 4284 sampled points had no ground
+  under them; reachable area spans x -32.4..32.4 m, z 5.6..166.4 m. The red
+  arm of the same sweep (world shrunk to half-width 30 m) reported 152 of
+  4284 missing, so the sweep can fail.
+- **Link chain**, from the symbol table on `dirt2.elf` (`arm-none-eabi-nm`):
+  563 `curl_` symbols, 561 `mbedtls_` symbols, and `socInit`, `update_check`,
+  `qr_encode_url` and `pausemenu_update` all present as defined text
+  symbols. No unresolved symbols other than the usual weak ones.
+- **The CIA artifact** contains the CA bundle: 121
+  `-----BEGIN CERTIFICATE-----` and 121 `-----END CERTIFICATE-----`
+  occurrences in `dirt2.cia`, and the RomFS filename `cacert.pem`.
+  `dirt2.cia` is 951,232 bytes; `dirt2.3dsx` is 1,240,832 bytes.
+- **In the Azahar 2126.0 emulator, booting the CIA** rather than the 3dsx:
+  the pause menu opens on SELECT and shows Resume / Options / Quit; Options
+  → Update completes and reports current 1.0.2, latest 1.0.0, "up to
+  date", and draws a QR code for the release on the bottom screen; B backs
+  out; SELECT resumes and the car drives again at 60 FPS. The simulation is
+  frozen while the menu is open (steps 0, alpha 0.00).
+- **The invisible wall, driven in the emulator** rather than only
+  unit-tested: with throttle held at full (6209 rpm) and the steering on
+  full lock for 25 seconds, the car came to rest pinned at 8 m off the
+  racing line, position x -16 y +1 z +98, all four wheels grounded (loads
+  2460/2332/3490/3306 N), lap readout red for off-track. It could not be
+  pushed further.
+- **The circuit's corner radius** went from 12 m to 24 m this release,
+  raising the physics-limited corner speed from about 37 km/h to about
+  52 km/h. The straights are unchanged at 96 m.
 
 Not verified:
 
-- **Nothing has been run on real hardware.** Every measurement above is from
-  the host build or from an emulator.
-- The CIA has been built but never installed — the QR route and the FBI install
-  are untested end to end.
-- The physics numbers are placeholders that produce plausible behaviour; they
-  are not tuned against anything real.
+- **Nothing in this project has ever run on real 3DS hardware.** Every
+  measurement above is from the host build or from the Azahar emulator.
+- The CIA has been built and booted in an emulator but never installed on a
+  console with FBI, so the QR install route is untested end to end.
+- The TLS path works in the emulator, where the raw sockets are serviced by
+  the host machine's network stack. It has not been exercised on a
+  console's own Wi-Fi.
+- The CA bundle is a 121-certificate, ~185 KB file copied unmodified from a
+  sibling project. That project has an open, unresolved concern that
+  parsing all 121 certificates peaks at roughly 325 KB of heap during the
+  TLS handshake. This project has not independently reproduced or ruled
+  out that measurement.
+- The physics numbers are placeholders that produce plausible behaviour;
+  they are not tuned against anything real.
 
 ## Licence
 

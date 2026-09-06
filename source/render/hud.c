@@ -204,6 +204,15 @@ void hud_shutdown(void) {
 #endif
 }
 
+#ifdef __3DS__
+/* Read-only accessor; hud_init/hud_shutdown still own this target's
+ * lifetime. Returns NULL when the target failed to allocate, so a caller
+ * that draws to it cannot mistake a failed init for a usable screen. */
+C3D_RenderTarget *hud_get_target(void) {
+    return s_ready ? s_target : NULL;
+}
+#endif
+
 void hud_draw(const HudStats *stats) {
 #ifdef __3DS__
     static const char *WHEEL_LABEL[4] = { "FL", "FR", "RL", "RR" };

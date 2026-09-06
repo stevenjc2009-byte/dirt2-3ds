@@ -99,29 +99,60 @@ void track_init(Track *track, const TrackWaypoint *waypoints, int count) {
 }
 
 void track_build_example_oval(Track *track) {
-    /* See track.h's header comment for the world-extent margins this shape
-     * is chosen against (world X in [-25,25], Z in [0,140]).
+    /* ENLARGED for v1.0.2. The first cut of this oval used a 12 m turn radius,
+     * and the emulator run that shipped v0.2 could not get round it: the car
+     * passes 130 km/h on the 96 m straight, and a 12 m hairpin is worth about
+     * 38 km/h. steve's call was to grow the track rather than slow the car --
+     * he had already said the handling felt good, and detuning a car that
+     * drives well to suit a track that does not is the wrong end to fix.
      *
-     *   half_width   = 4m  (8m-wide track)
-     *   turn_radius  = 12m (both hairpins)
-     *   straight_x   = 12m (== turn_radius, so a straight's end lines up
-     *                       exactly with the hairpin's tangent point)
-     *   z_bottom/top = the two hairpin centres, 96m apart (the straights)
+     * Corner speed goes as sqrt(mu * g * R). At mu ~= 0.9 on this tarmac,
+     * R = 12 m gives 10.3 m/s (37 km/h) and R = 24 m gives 14.6 m/s (52 km/h).
+     * Doubling the radius is the largest change the world can hold once the
+     * ground is widened (see below) and buys ~40% more corner speed. It does
+     * NOT make the hairpin flat-out from the straight, and it is not meant to
+     * -- with race/barrier.c's walls in place, arriving too fast now scrubs
+     * the wall and costs time instead of ending the run.
      *
-     * Worst-case extent from the world origin is radius + half_width = 16m
-     * in X (world bound 25m, 9m margin) and, at the hairpin apexes,
-     * z_bottom_center - 16 = 6 (world bound 0, 6m margin) and
-     * z_top_center + 16 = 134 (world bound 140, 6m margin). All margins
-     * checked by hand against world/testground.h's zone lengths (flat 40 +
-     * hills 60 + washboard 40 = 140) as configured by main.c's
-     * make_placeholder_testground_config -- if that config ever changes,
-     * these numbers need rechecking against it. */
-    const f32 half_width = 4.0f;
-    const f32 turn_radius = 12.0f;
+     *   half_width   = 5m   (10m-wide track, was 8m -- a wider ribbon gives
+     *                        room to run wide without immediately being on
+     *                        the wall, which matters far more now that the
+     *                        edge is solid)
+     *   turn_radius  = 24m  (both hairpins, was 12m)
+     *   straight_x   = 24m  (== turn_radius, so a straight's end lines up
+     *                        exactly with the hairpin's tangent point)
+     *   z_bottom/top = the two hairpin centres, still 96m apart -- the
+     *                  straight length is UNCHANGED on purpose, so the top
+     *                  speed steve drove and liked is the same one he gets
+     *                  back. Only the corners moved.
+     *
+     * The RIBBON reaches radius + half_width = 29m in X, but the ribbon is not
+     * the outermost thing here. race/barrier.c puts its wall a further
+     * BARRIER_RUNOFF_METRES (4m) out, on the far side of a gravel run-off
+     * strip, so the drivable world reaches 33m in X and, at the hairpin
+     * apexes, z_bottom_center - 33 = 5 and z_top_center + 33 = 167. Those are
+     * the numbers the world has to contain, not the ribbon's.
+     *
+     * THIS NO LONGER FITS THE OLD WORLD, and that is the point: the test
+     * ground was grown to match, to X in [-38,38] and Z in [0,175] (flat 45 +
+     * hills 70 + washboard 60), in main.c's make_placeholder_testground_config.
+     * The two are a matched pair -- 5 m of X margin, 5 m at the south apex and
+     * 8 m at the north -- so if either is edited the other needs rechecking
+     * against it. Getting this wrong does not fail loudly: the wall simply
+     * runs off the edge of the world and the height query starts returning
+     * false under a car that is still visually on the road.
+     *
+     * arc_segments went 12 -> 16 because the barrier follows the waypoint
+     * ring. At R = 24 a 12-segment hairpin has 6.3 m chords, and a wall built
+     * from straight chords cuts the corner by the chord's sagitta; 16 segments
+     * puts that back under 0.3 m. Waypoint count is 2 + 16 + 1 + 15 = 34,
+     * against TRACK_MAX_WAYPOINTS of 64. */
+    const f32 half_width = 5.0f;
+    const f32 turn_radius = 24.0f;
     const f32 straight_x = turn_radius;
-    const f32 z_bottom_center = 22.0f;
-    const f32 z_top_center = 118.0f;
-    const int arc_segments = 12; /* subdivisions per 180-degree hairpin */
+    const f32 z_bottom_center = 38.0f;
+    const f32 z_top_center = 134.0f;
+    const int arc_segments = 16; /* subdivisions per 180-degree hairpin */
 
     TrackWaypoint wp[TRACK_MAX_WAYPOINTS];
     int n = 0;

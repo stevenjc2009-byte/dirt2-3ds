@@ -94,6 +94,22 @@ void hud_shutdown(void);
  * would land on the wrong screen. */
 void hud_draw(const HudStats *stats);
 
+/* ADDITIVE: exposes the BOTTOM-screen render target, exactly as
+ * renderer.h's renderer_get_target exposes the top one and for the same
+ * reason -- ui/pausemenu.c needs to hand it to C2D_SceneBegin so the pause
+ * screen can take over the bottom screen while the game is paused, WITHOUT
+ * creating a second render target for a screen that already has one.
+ *
+ * hud_init/hud_shutdown still own the lifetime; this is read-only, and
+ * returns NULL if the target was never successfully created. Guarded by
+ * __3DS__ (and pulls in citro3d.h) so this header stays includable, with no
+ * declaration at all, from a host-build translation unit -- same pattern as
+ * renderer.h. */
+#ifdef __3DS__
+#include <citro3d.h>
+C3D_RenderTarget *hud_get_target(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

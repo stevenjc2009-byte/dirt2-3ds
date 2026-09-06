@@ -26,13 +26,15 @@ include $(DEVKITARM)/3ds_rules
 #              in this project is written relative to source/ (e.g.
 #              "core/types.h", "vehicle/vehicle.h") rather than bare filenames,
 #              so headers in different subsystem folders never collide.
-# ROMFS        empty for Phase 1 -- no assets shipped in RomFS yet. Kept as a
-#              real target (not commented out) so a future asset (fonts,
-#              tracks, ...) has somewhere to go without a Makefile change.
+# ROMFS        ships romfs/cacert.pem, the CA bundle source/net/http.c reads
+#              once at init and hands to libcurl as an in-memory
+#              CURLOPT_CAINFO_BLOB. It is a real shipped asset now, not the
+#              empty placeholder it was in Phase 1 -- deleting it breaks
+#              every HTTPS request the update check makes.
 #---------------------------------------------------------------------------------
 TARGET		:=	dirt2
 BUILD		:=	build
-SOURCES		:=	source source/core source/vehicle source/input source/render source/world source/race
+SOURCES		:=	source source/core source/vehicle source/input source/render source/world source/race source/net source/update source/ui
 DATA		:=	data
 INCLUDES	:=	source
 ROMFS		:=	romfs
@@ -73,11 +75,40 @@ CXXFLAGS	:= $(CFLAGS) -fno-rtti -fno-exceptions -std=gnu++11
 ASFLAGS	:=	-g $(ARCH)
 LDFLAGS	=	-specs=3dsx.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-# citro2d before citro3d: citro2d is built on top of citro3d and the linker
-# resolves left to right, so citro2d's own citro3d calls need citro3d's symbols
-# still to come. debugdraw.h's on-screen text (frame counters, per-wheel
-# compression/slip readouts) is citro2d; everything else is bare citro3d.
-LIBS	:= -lcitro2d -lcitro3d -lctru -lm
+# LINK ORDER IS LOAD-BEARING. The devkitARM linker resolves static archives
+# strictly left to right and does not re-scan an archive it has already passed,
+# so every library must appear BEFORE the libraries it depends on.
+#
+# citro2d before citro3d: citro2d is built on top of citro3d, so citro2d's own
+# citro3d calls need citro3d's symbols still to come. debugdraw.h's and hud.h's
+# on-screen text is citro2d; everything else is bare citro3d.
+#
+# Then the networking stack for source/net/http.c, in dependency order:
+#   curl        -> calls into mbedtls for TLS, zlib for Content-Encoding, and
+#                  libctru for the actual BSD sockets (soc:U)
+#   mbedtls     -> the TLS protocol layer, calls mbedx509
+#   mbedx509    -> certificate parsing, calls mbedcrypto
+#   mbedcrypto  -> the primitives; depends on nothing else here
+#   z           -> zlib, pulled in by curl
+#
+# NOTE -lctru MOVED TO THE END, after the whole network stack. It used to sit
+# third. citro2d/citro3d need it, but so does curl -- for socket/connect/recv
+# via soc:U -- and libctru is the LAST consumer in the chain, so it has to be
+# the last archive scanned. With -lctru back in its old position, curl's socket
+# references resolve against an archive the linker has already walked past, and
+# the link fails with undefined references to symbols that are visibly present
+# in libctru.a. Loud rather than subtle, but easy to "fix" in the wrong place.
+#
+# WHY curl+mbedTLS AT ALL, rather than libctru's own httpc/ssl:C. This was
+# MEASURED on steve's real console during the Skywave project, not assumed:
+# the 3DS's ssl:C service tops out at TLS 1.1, and GitHub has required TLS 1.2+
+# since 2018. github.com, api.github.com, objects.githubusercontent.com and
+# release-assets.githubusercontent.com all returned a TLS "protocol version"
+# alert. SSLCOPT_DisableVerify does NOT help -- it disables certificate
+# checking, not protocol negotiation, so the handshake still never completes.
+# curl over raw soc:U with its own bundled mbedTLS bypasses ssl:C entirely,
+# which is the same route Universal-Updater and FBI take for the same reason.
+LIBS	:= -lcitro2d -lcitro3d -lcurl -lmbedtls -lmbedx509 -lmbedcrypto -lz -lctru -lm
 
 #---------------------------------------------------------------------------------
 # list of directories containing libraries, this must be the top level containing
@@ -203,6 +234,7 @@ $(OUTPUT).banner	:	cia/banner.png cia/banner.wav
 $(OUTPUT).cia	:	$(OUTPUT).elf $(OUTPUT).smdh $(OUTPUT).banner dirt2.rsf
 	@echo $(notdir $@) ...
 	@$(MAKEROM) -f cia -o $@ -elf $(OUTPUT).elf -rsf dirt2.rsf \
+		-DAPP_ROMFS=$(ROMFS) \
 		-icon $(OUTPUT).smdh -banner $(OUTPUT).banner -exefslogo -target t
 	@echo built ... $(notdir $@)
 
